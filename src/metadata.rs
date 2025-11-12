@@ -35,6 +35,25 @@ impl MetadataStore {
         Ok(Self { index, pool })
     }
 
+    /// Returns `true` if there is a file with the given path stored in the metadata
+    /// store.
+    pub async fn exists(&self, path: &str) -> sqlx::Result<bool> {
+        let query = sqlx::query_scalar!(
+            r#"
+            SELECT 1
+            FROM tantivy.metadata
+            WHERE index = $1
+              AND path = $2
+            "#,
+            self.index,
+            path,
+        );
+
+        let row = query.fetch_optional(&self.pool).await?;
+
+        Ok(row.is_some())
+    }
+
     /// Reads the metadata file stored in the metadata store at the given path.
     ///
     /// Returns `None` if the file does not exist.

@@ -1,7 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use derive_more::Debug;
@@ -26,6 +26,10 @@ use crate::{
     utils::{PathExt, WrapIoErrorExt},
     writer::Writer,
 };
+
+// TODO(MLB): replace with `const`s once the `const` version of `Path::new` is stabilized
+static META_JSON: LazyLock<&'static Path> = LazyLock::new(|| Path::new("meta.json"));
+static MANAGED_JSON: LazyLock<&'static Path> = LazyLock::new(|| Path::new(".managed.json"));
 
 /// A [`Directory`] implementation that reads and writes files to a remote object
 /// storage using [`opendal`], with metadata stored in PostgreSQL.
@@ -127,11 +131,19 @@ impl Directory for RemoteDirectory {
         Ok(())
     }
 
-    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        let path = self.path(path);
-        dbg!(&path);
+    fn exists(&self, filepath: &Path) -> Result<bool, OpenReadError> {
+        // For files which are written using `atomic_write()`, we have to look inside
+        // PostgreSQL to know whether they exist.
+        if filepath == *META_JSON || filepath == *MANAGED_JSON {
+            let path = filepath.try_to_str::<OpenReadError>()?;
+            return self
+                .rt
+                .block_on(self.metadata.exists(path))
+                .map_err(OpenReadError::wrapper(filepath));
+        }
 
-        let result = self.rt.block_on(self.metadata(&path));
+        let filepath = self.path(filepath);
+        let result = self.rt.block_on(self.metadata(&filepath));
         match result {
             Ok(_) => Ok(true),
             Err(error) => {

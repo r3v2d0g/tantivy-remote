@@ -1,4 +1,5 @@
 use derive_more::Debug;
+use eyre::{Context, Result};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -14,8 +15,24 @@ pub struct MetadataStore {
 
 impl MetadataStore {
     /// Creates a new metadata store for the given index.
-    pub(crate) fn new(index: Uuid, pool: PgPool) -> Self {
-        Self { index, pool }
+    ///
+    /// If the index does not exists, it creates it.
+    pub(crate) async fn open(index: Uuid, pool: PgPool) -> Result<Self> {
+        let create = sqlx::query!(
+            r#"
+            INSERT INTO tantivy.directories (index)
+            VALUES ($1)
+            ON CONFLICT DO NOTHING
+            "#,
+            index,
+        );
+
+        create
+            .execute(&pool)
+            .await
+            .wrap_err("failed to create index")?;
+
+        Ok(Self { index, pool })
     }
 
     /// Reads the metadata file stored in the metadata store at the given path.

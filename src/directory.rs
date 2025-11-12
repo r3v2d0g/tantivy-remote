@@ -65,21 +65,22 @@ pub struct RemoteDirectory {
 
 impl RemoteDirectory {
     /// Creates a new directory to read/write from/to the given index.
-    /// Opens the directory for the given index.
+    ///
+    /// If the index does not exist, it creates it.
     ///
     /// ## Panics
     ///
     /// This will panic if called from outside of the context of a `tokio` runtime.
-    pub fn new(index: Uuid, operator: opendal::Operator, pool: PgPool) -> Self {
-        let metadata = MetadataStore::new(index, pool);
+    pub async fn open(index: Uuid, operator: opendal::Operator, pool: PgPool) -> Result<Self> {
+        let metadata = MetadataStore::open(index, pool).await?;
 
-        Self {
+        Ok(Self {
             index,
             rt: Handle::current(),
             cache: Cache::default(),
             operator: Operator::from(operator),
             metadata,
-        }
+        })
     }
 
     /// Returns the path that should be used for the file at `path` for the index.

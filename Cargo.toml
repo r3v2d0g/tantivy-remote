@@ -12,7 +12,6 @@ edition = "2024"
 async-trait = "0.1"
 derive_more = { version = "2.0", features = ["debug", "deref", "from"] }
 eyre = "0.6"
-foyer = "0.20"
 gxhash = "3.5"
 opendal = "0.54"
 pin-project-lite = "0.2"

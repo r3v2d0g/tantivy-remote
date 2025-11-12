@@ -1,0 +1,27 @@
+[package]
+name = "tantivy-remote"
+description = "tantivy with opendal and sqlx"
+version = "0.1.0"
+homepage = "https://github.com/r3v2d0g/tantivy-remote"
+documentation = "https://docs.rs/tantivy-remote"
+license = "MPL-2.0"
+authors = ["Matthieu (MLB) Le brazidec <r3v2d0g@jesus.gg>"]
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+derive_more = { version = "2.0", features = ["debug", "deref", "from"] }
+eyre = "0.6"
+foyer = "0.20"
+gxhash = "3.5"
+opendal = "0.54"
+pin-project-lite = "0.2"
+scc = "3.3"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
+tantivy = { version = "0.25", features = ["quickwit"] }
+tokio = { version = "1.48", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = "1.18"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["full"] }

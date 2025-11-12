@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO tantivy.metadata\n              (index, path, content)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (index, path)\n            DO UPDATE SET content = EXCLUDED.content\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2dc3b40c559b177eb5a52c342c05b7716e15e3544a5a973bee3b9af129b7f57f"
+}

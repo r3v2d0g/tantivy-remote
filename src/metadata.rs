@@ -35,9 +35,69 @@ impl MetadataStore {
         Ok(Self { index, pool })
     }
 
-    /// Returns `true` if there is a file with the given path stored in the metadata
-    /// store.
-    pub async fn exists(&self, path: &str) -> sqlx::Result<bool> {
+    /// Returns `true` if there is a non-metadata file with the given path that exists
+    /// in the metadata store.
+    pub async fn file_exists(&self, path: &str) -> sqlx::Result<bool> {
+        let query = sqlx::query_scalar!(
+            r#"
+            SELECT 1
+            FROM tantivy.files
+            WHERE index = $1
+              AND path = $2
+              AND deleted_at IS NULL
+            "#,
+            self.index,
+            path,
+        );
+
+        let row = query.fetch_optional(&self.pool).await?;
+
+        Ok(row.is_some())
+    }
+
+    /// Creates the non-metadata file into the metadata store.
+    pub async fn create_file(&self, path: &str) -> sqlx::Result<()> {
+        let create = sqlx::query!(
+            r#"
+            INSERT INTO tantivy.files (index, path)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            "#,
+            self.index,
+            path,
+        );
+
+        create.execute(&self.pool).await?;
+
+        Ok(())
+    }
+
+    /// Marks the given non-metadata file as having been deleted in the metadata store.
+    ///
+    /// Returns `true` if the file was deleted, `false` if it did not exist or was
+    /// already deleted.
+    pub async fn delete_file(&self, path: &str) -> sqlx::Result<bool> {
+        let update = sqlx::query_scalar!(
+            r#"
+            UPDATE tantivy.files
+            SET deleted_at = NOW()
+            WHERE index = $1
+              AND path = $2
+              AND deleted_at IS NULL
+            RETURNING 1
+            "#,
+            self.index,
+            path,
+        );
+
+        let row = update.fetch_optional(&self.pool).await?;
+
+        Ok(row.is_some())
+    }
+
+    /// Returns `true` if there is a metadata file with the given path stored in the
+    /// metadata store.
+    pub async fn metadata_exists(&self, path: &str) -> sqlx::Result<bool> {
         let query = sqlx::query_scalar!(
             r#"
             SELECT 1
@@ -57,7 +117,7 @@ impl MetadataStore {
     /// Reads the metadata file stored in the metadata store at the given path.
     ///
     /// Returns `None` if the file does not exist.
-    pub async fn read(&self, path: &str) -> sqlx::Result<Option<Vec<u8>>> {
+    pub async fn read_metadata(&self, path: &str) -> sqlx::Result<Option<Vec<u8>>> {
         let query = sqlx::query_scalar!(
             r#"
             SELECT content
@@ -73,7 +133,7 @@ impl MetadataStore {
     }
 
     /// Writes the given content to the metadata store at the given path.
-    pub async fn write(&self, path: &str, content: &[u8]) -> sqlx::Result<()> {
+    pub async fn write_metadata(&self, path: &str, content: &[u8]) -> sqlx::Result<()> {
         let query = sqlx::query!(
             r#"
             INSERT INTO tantivy.metadata

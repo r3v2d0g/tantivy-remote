@@ -69,6 +69,6 @@ impl AsyncWrite for Writer {
 impl TerminatingWrite for Writer {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
         // TODO(MLB): flush as well?
-        self.rt.block_on(async { self.writer.shutdown().await })
+        self.rt.clone().block_on(self.shutdown())
     }
 }

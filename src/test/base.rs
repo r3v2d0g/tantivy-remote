@@ -8,7 +8,7 @@ use tantivy::{
     schema::{STORED, SchemaBuilder, TEXT},
 };
 use tokio::task;
-use uuid::uuid;
+use uuid::Uuid;
 
 use crate::RemoteDirectory;
 
@@ -19,7 +19,7 @@ async fn basic() {
         .expect("failed to create operator")
         .finish();
 
-    let index = uuid!("53af7d56-d3e0-48f9-8663-07a66a7ca5e9");
+    let index = Uuid::new_v4();
     let pool = PgPool::connect("postgresql://postgres:postgres@localhost:15432/postgres")
         .await
         .expect("failed to connect to database");
@@ -38,7 +38,9 @@ async fn basic() {
         .await
         .expect("failed to clean up metadata");
 
-    let directory = RemoteDirectory::new(index, operator, pool);
+    let directory = RemoteDirectory::open(index, operator, pool)
+        .await
+        .expect("failed to open directory");
 
     let mut schema = SchemaBuilder::new();
     let title = schema.add_text_field("title", TEXT | STORED);

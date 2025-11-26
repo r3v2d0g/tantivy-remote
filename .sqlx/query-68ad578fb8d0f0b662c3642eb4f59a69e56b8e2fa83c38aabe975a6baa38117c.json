@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE tantivy.files\n            SET deleted_at = NOW()\n            WHERE index = $1\n              AND path = $2\n              AND deleted_at IS NULL\n            RETURNING 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "?column?",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "68ad578fb8d0f0b662c3642eb4f59a69e56b8e2fa83c38aabe975a6baa38117c"
+}

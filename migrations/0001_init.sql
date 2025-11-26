@@ -7,7 +7,9 @@ CREATE TABLE tantivy.directories (
 CREATE TABLE tantivy.files (
     index UUID NOT NULL,
     path TEXT NOT NULL,
-    deleted BOOLEAN NOT NULL DEFAULT FALSE,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
 
     FOREIGN KEY (index)
     REFERENCES tantivy.directories(index)

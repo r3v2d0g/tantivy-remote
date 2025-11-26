@@ -103,6 +103,12 @@ impl Cache {
         Ok(Arc::clone(entry.get()))
     }
 
+    /// Returns `true` if the file is being created and/or has been flushed but not yet
+    /// synced.
+    pub async fn is_created(&self, filepath: &Path) -> bool {
+        self.created.contains_async(filepath).await
+    }
+
     /// Marks the file at the given path as having been created, returning a
     /// [`CreatedEntry`] for it so that it can later be marked as having been flushed.
     pub async fn created(&self, filepath: PathBuf) -> Result<CreatedEntry, OpenWriteError> {
@@ -117,6 +123,25 @@ impl Cache {
 
             Err(_) => Err(OpenWriteError::FileAlreadyExists(filepath)),
         }
+    }
+
+    /// Iterates over all of the created files, returning the ones which have been
+    /// flushed and closed.
+    pub async fn sync(&self) -> Vec<PathBuf> {
+        let mut flushed = vec![];
+        self.created
+            .iter_mut_async(|entry| {
+                let (_, closed) = *entry;
+                if closed {
+                    let (path, _) = entry.consume();
+                    flushed.push(path);
+                }
+
+                true
+            })
+            .await;
+
+        flushed
     }
 }
 
@@ -159,11 +184,5 @@ impl MetadataCache {
         };
 
         Ok(Arc::clone(entry.get()))
-    }
-}
-
-impl Drop for CreatedEntry {
-    fn drop(&mut self) {
-        self.cache.remove_sync(&self.path);
     }
 }

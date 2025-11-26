@@ -107,56 +107,87 @@ impl RemoteDirectory {
 }
 
 impl Directory for RemoteDirectory {
-    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        let path = self.path(path);
+    fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        // We first have to make sure that the file is supposed to exist, either because it
+        // has been created although the directory hasn't been synced yet, or because it is
+        // present in PSQL and hasn't been marked as deleted.
+        let is_created = self.rt.block_on(async {
+            let filepath = self.path(filepath);
+            println!("{}", filepath.display());
+            self.cache.is_created(&filepath).await
+        });
 
+        let exists = if is_created {
+            true
+        } else {
+            let path = filepath.try_to_str::<OpenReadError>()?;
+            self.rt
+                .block_on(self.metadata.file_exists(path))
+                .map_err(OpenReadError::wrapper(filepath))?
+        };
+
+        if !exists {
+            return Err(OpenReadError::FileDoesNotExist(filepath.into()));
+        }
+
+        let filepath = self.path(filepath);
         self.rt.block_on(async {
             let open = async || {
-                let metadata = self.metadata(&path).await?;
+                let metadata = self.metadata(&filepath).await?;
 
-                let path = path.try_to_str::<OpenReadError>()?;
+                let path = filepath.try_to_str::<OpenReadError>()?;
                 let file = File::open(path, metadata, self.rt.clone(), self.operator.clone());
 
                 Ok(file)
             };
 
-            self.cache.file(&path, open).await
+            self.cache.file(&filepath, open).await
         })
     }
 
-    fn delete(&self, _filepath: &Path) -> Result<(), DeleteError> {
-        // TODO(MLB): mark the file as deleted in PSQL
-        // TODO(MLB): add a TLL to the files in S3
+    fn delete(&self, filepath: &Path) -> Result<(), DeleteError> {
+        let path = filepath.try_to_str::<DeleteError>()?;
+        let deleted = self
+            .rt
+            .block_on(self.metadata.delete_file(&path))
+            .map_err(DeleteError::wrapper(filepath))?;
+
+        if !deleted {
+            return Err(DeleteError::FileDoesNotExist(filepath.into()));
+        }
+
+        // TODO(MLB): add a TLL to the files in S3?
 
         Ok(())
     }
 
     fn exists(&self, filepath: &Path) -> Result<bool, OpenReadError> {
-        // For files which are written using `atomic_write()`, we have to look inside
-        // PostgreSQL to know whether they exist.
+        let path = filepath.try_to_str::<OpenReadError>()?;
+
         if filepath == *META_JSON || filepath == *MANAGED_JSON {
-            let path = filepath.try_to_str::<OpenReadError>()?;
             return self
                 .rt
-                .block_on(self.metadata.exists(path))
+                .block_on(self.metadata.metadata_exists(path))
                 .map_err(OpenReadError::wrapper(filepath));
         }
 
-        let filepath = self.path(filepath);
-        let result = self.rt.block_on(self.metadata(&filepath));
-        match result {
-            Ok(_) => Ok(true),
-            Err(error) => {
-                if matches!(error, OpenReadError::FileDoesNotExist(_)) {
-                    Ok(false)
-                } else {
-                    Err(error)
-                }
-            }
-        }
+        self.rt
+            .block_on(self.metadata.file_exists(path))
+            .map_err(OpenReadError::wrapper(filepath))
     }
 
     fn open_write(&self, filepath: &Path) -> Result<WritePtr, OpenWriteError> {
+        // We first have to make sure that the file does not already exist.
+        let path = filepath.try_to_str::<OpenWriteError>()?;
+        let exists = self
+            .rt
+            .block_on(self.metadata.file_exists(path))
+            .map_err(OpenWriteError::wrapper(filepath))?;
+
+        if exists {
+            return Err(OpenWriteError::FileAlreadyExists(filepath.into()));
+        }
+
         let filepath = self.path(filepath);
         let path = filepath.try_to_str::<OpenWriteError>()?;
 
@@ -190,7 +221,7 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<OpenReadError>()?;
 
         self.rt
-            .block_on(self.metadata.read(path))
+            .block_on(self.metadata.read_metadata(path))
             .map_err(OpenReadError::wrapper(filepath))?
             .ok_or_else(|| OpenReadError::FileDoesNotExist(filepath.into()))
     }
@@ -199,12 +230,30 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<io::Error>()?;
 
         self.rt
-            .block_on(self.metadata.write(path, data))
+            .block_on(self.metadata.write_metadata(path, data))
             .map_err(io::Error::wrapper(filepath))
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        // TODO(MLB): add the files which have been flushed to PSQL
+        let flushed = self.rt.block_on(self.cache.sync());
+        if flushed.is_empty() {
+            return Ok(());
+        }
+
+        for path in flushed {
+            // We have to remove the first part of the path, as it contains the index ID, which
+            // we don't include in PSQL.
+            let mut components = path.components();
+            components.next();
+
+            let filepath = components.as_path();
+            let path = filepath.try_to_str::<io::Error>()?;
+
+            self.rt
+                .block_on(self.metadata.create_file(path))
+                .map_err(io::Error::wrapper(filepath))?;
+        }
+
         // TODO(MLB): remove from the cache
 
         Ok(())

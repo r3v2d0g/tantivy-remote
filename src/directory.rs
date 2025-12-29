@@ -113,7 +113,6 @@ impl Directory for RemoteDirectory {
         // present in PSQL and hasn't been marked as deleted.
         let is_created = self.rt.block_on(async {
             let filepath = self.path(filepath);
-            println!("{}", filepath.display());
             self.cache.is_created(&filepath).await
         });
 

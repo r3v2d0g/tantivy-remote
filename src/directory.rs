@@ -65,6 +65,20 @@ pub struct RemoteDirectory {
     /// [1]: Directory::atomic_read()
     /// [2]: Directory::atomic_write()
     metadata: MetadataStore,
+
+    /// Defines the size of the chunks which should be read from the storage backend.
+    read_chunks: Option<usize>,
+
+    /// Defines the size of the chunks which should be written to the storage backend.
+    write_chunks: Option<usize>,
+
+    /// Defines the number of concurrent requests to make when reading a file from the
+    /// storage backend.
+    read_concurrency: Option<usize>,
+
+    /// Defines the number of concurrent requests to make when writing a file to the
+    /// storage backend.
+    write_concurrency: Option<usize>,
 }
 
 impl RemoteDirectory {
@@ -84,7 +98,37 @@ impl RemoteDirectory {
             cache: Cache::default(),
             operator: Operator::from(operator),
             metadata,
+            read_chunks: None,
+            write_chunks: None,
+            read_concurrency: None,
+            write_concurrency: None,
         })
+    }
+
+    /// Defines the size of the chunks which should be read from the storage backend.
+    pub fn with_read_chunks(mut self, chunks: usize) -> Self {
+        self.read_chunks = Some(chunks);
+        self
+    }
+
+    /// Defines the size of the chunks which should be written to the storage backend.
+    pub fn with_write_chunks(mut self, chunks: usize) -> Self {
+        self.write_chunks = Some(chunks);
+        self
+    }
+
+    /// Defines the number of concurrent requests to make when reading a file from the
+    /// storage backend.
+    pub fn with_read_concurrency(mut self, concurrency: usize) -> Self {
+        self.read_concurrency = Some(concurrency);
+        self
+    }
+
+    /// Defines the number of concurrent requests to make when writing a file to the
+    /// storage backend.
+    pub fn with_write_concurrency(mut self, concurrency: usize) -> Self {
+        self.write_concurrency = Some(concurrency);
+        self
     }
 
     /// Returns the path that should be used for the file at `path` for the index.
@@ -135,7 +179,14 @@ impl Directory for RemoteDirectory {
                 let metadata = self.metadata(&filepath).await?;
 
                 let path = filepath.try_to_str::<OpenReadError>()?;
-                let file = File::open(path, metadata, self.rt.clone(), self.operator.clone());
+                let file = File::open(
+                    path,
+                    metadata,
+                    self.rt.clone(),
+                    self.operator.clone(),
+                    self.read_chunks,
+                    self.read_concurrency,
+                );
 
                 Ok(file)
             };
@@ -148,7 +199,7 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<DeleteError>()?;
         let deleted = self
             .rt
-            .block_on(self.metadata.delete_file(&path))
+            .block_on(self.metadata.delete_file(path))
             .map_err(DeleteError::wrapper(filepath))?;
 
         if !deleted {
@@ -191,8 +242,16 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<OpenWriteError>()?;
 
         let writer = self.rt.block_on(async {
-            let result = self.operator.writer_with(path).append(false).await;
-            let writer = match result {
+            let mut writer = self.operator.writer_with(path).append(false);
+            if let Some(chunks) = self.write_chunks {
+                writer = writer.chunk(chunks);
+            }
+
+            if let Some(concurrency) = self.write_concurrency {
+                writer = writer.concurrent(concurrency);
+            }
+
+            let writer = match writer.await {
                 Ok(writer) => writer,
                 Err(error) => {
                     let filepath = filepath.to_path_buf();

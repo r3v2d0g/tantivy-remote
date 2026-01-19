@@ -19,10 +19,22 @@ use crate::operator::Operator;
 #[derive(Clone)]
 pub struct File {
     rt: Handle,
+
+    /// The storage backend the file this is reading is located in.
     operator: Operator,
 
+    /// The path of the file this is reading.
     path: String,
+
+    /// The metadata of the file this is reading.
     metadata: Arc<Metadata>,
+
+    /// Defines the size of the chunks which should be read from the storage backend.
+    chunks: Option<usize>,
+
+    /// Defines the number of concurrent requests to make when reading a file from the
+    /// storage backend.
+    concurrency: Option<usize>,
 }
 
 impl File {
@@ -31,12 +43,16 @@ impl File {
         metadata: Arc<Metadata>,
         rt: Handle,
         operator: Operator,
+        chunks: Option<usize>,
+        concurrency: Option<usize>,
     ) -> Arc<dyn FileHandle> {
         Arc::new(Self {
             rt,
             operator,
             path: path.into(),
             metadata,
+            chunks,
+            concurrency,
         })
     }
 }
@@ -48,13 +64,16 @@ impl FileHandle for File {
     }
 
     async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        // TODO(MLB): cache?
-        let reader = self
-            .operator
-            .reader(&self.path)
-            .await
-            .map_err(io::Error::other)?;
+        let mut reader = self.operator.reader_with(&self.path);
+        if let Some(chunks) = self.chunks {
+            reader = reader.chunk(chunks);
+        }
 
+        if let Some(concurrency) = self.concurrency {
+            reader = reader.concurrent(concurrency);
+        }
+
+        let reader = reader.await.map_err(io::Error::other)?;
         let range = Range {
             start: range.start as u64,
             end: range.end as u64,

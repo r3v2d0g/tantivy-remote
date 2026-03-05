@@ -131,8 +131,7 @@ impl Cache {
         let mut flushed = vec![];
         self.created
             .iter_mut_async(|entry| {
-                let (_, closed) = *entry;
-                if closed {
+                if *entry {
                     let (path, _) = entry.consume();
                     flushed.push(path);
                 }

@@ -66,6 +66,14 @@ struct MetadataCache {
 }
 
 impl Cache {
+    /// Gets the [`FileHandle`] for the given path from the cache, returning `None` if
+    /// it is not cached.
+    pub async fn get_file(&self, path: &Path) -> Option<Arc<dyn FileHandle>> {
+        self.files
+            .read_async(path, |_, file| Arc::clone(file))
+            .await
+    }
+
     /// Fetches the metadata for the given path from the cache, fetching it and
     /// populating the cache using the provided closure if it is not already cached.
     pub async fn metadata(
@@ -85,7 +93,7 @@ impl Cache {
     ) -> Result<Arc<dyn FileHandle>, OpenReadError> {
         // fast path: try to get the file handle from the cache – this does not lock other
         //            readers.
-        if let Some(file) = self.files.read_sync(path, |_, file| Arc::clone(file)) {
+        if let Some(file) = self.get_file(path).await {
             return Ok(file);
         }
 
@@ -155,6 +163,12 @@ impl CreatedEntry {
 }
 
 impl MetadataCache {
+    /// Gets the metadata for the given path from the cache.
+    async fn get(&self, path: &Path) -> Option<Arc<Metadata>> {
+        self.read_async(path, |_, metadata| Arc::clone(metadata))
+            .await
+    }
+
     /// Fetches the metadata for the given path from the cache, populating it using the
     /// provided async closure if it is not already cached.
     async fn fetch(
@@ -163,10 +177,7 @@ impl MetadataCache {
         fetch: impl AsyncFnOnce() -> Result<Metadata, OpenReadError>,
     ) -> Result<Arc<Metadata>, OpenReadError> {
         // fast path: try to read the metadata from the cache – this does not lock other readers.
-        if let Some(metadata) = self
-            .read_async(path, |_, metadata| Arc::clone(metadata))
-            .await
-        {
+        if let Some(metadata) = self.get(path).await {
             return Ok(metadata);
         }
 

@@ -6,7 +6,6 @@ use std::{
 
 use derive_more::Debug;
 use eyre::Result;
-use opendal::Metadata;
 use sqlx::PgPool;
 use tantivy::{
     Directory, TantivyError,
@@ -140,43 +139,37 @@ impl RemoteDirectory {
         base.push(path);
         base
     }
-
-    /// Fetches the metadata for the given path.
-    async fn metadata(&self, path: &Path) -> Result<Arc<Metadata>, OpenReadError> {
-        // TODO(MLB): check whether the file exists + has not been deleted in PSQL
-
-        let fetch = async || self.operator.metadata(path).await;
-        self.cache.metadata(path, fetch).await
-    }
 }
 
 impl Directory for RemoteDirectory {
     fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        // We first have to make sure that the file is supposed to exist, either because it
-        // has been created although the directory hasn't been synced yet, or because it is
-        // present in PSQL and hasn't been marked as deleted.
-        let is_created = self.rt.block_on(async {
-            let filepath = self.path(filepath);
-            self.cache.is_created(&filepath).await
-        });
-
-        let exists = if is_created {
-            true
-        } else {
-            let path = filepath.try_to_str::<OpenReadError>()?;
-            self.rt
-                .block_on(self.metadata.file_exists(path))
-                .map_err(OpenReadError::wrapper(filepath))?
-        };
-
-        if !exists {
-            return Err(OpenReadError::FileDoesNotExist(filepath.into()));
-        }
-
-        let filepath = self.path(filepath);
         self.rt.block_on(async {
+            let path = filepath.try_to_str::<OpenReadError>()?;
+            let filepath = self.path(filepath);
+
+            if let Some(file) = self.cache.get_file(&filepath).await {
+                return Ok(file);
+            }
+
+            // We haven't already opened the file, so we need to validate that it exists.
+            let exists = if self.cache.is_created(&filepath).await {
+                true
+            } else {
+                self.metadata
+                    .file_exists(path)
+                    .await
+                    .map_err(OpenReadError::wrapper(path))?
+            };
+
+            if !exists {
+                return Err(OpenReadError::FileDoesNotExist(path.into()));
+            }
+
             let open = async || {
-                let metadata = self.metadata(&filepath).await?;
+                let metadata = self
+                    .cache
+                    .metadata(&filepath, || self.operator.metadata(&filepath))
+                    .await?;
 
                 let path = filepath.try_to_str::<OpenReadError>()?;
                 let file = File::open(

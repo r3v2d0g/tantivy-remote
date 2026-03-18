@@ -8,8 +8,14 @@ license = "MPL-2.0"
 authors = ["Matthieu (MLB) Le brazidec <r3v2d0g@jesus.gg>"]
 edition = "2024"
 
+[features]
+# This makes `block-on-place` trace all calls to one of the crate's blocking
+# functions from within a tokio runtime context.
+blocking-tracing = ["block-on-place/tracing"]
+
 [dependencies]
 async-trait = "0.1"
+block-on-place = "0.1"
 derive_more = { version = "2.0", features = ["debug", "deref", "from"] }
 eyre = "0.6"
 gxhash = "3.5"

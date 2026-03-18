@@ -4,6 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use block_on_place::HandleExt;
 use opendal::FuturesAsyncWriter;
 use pin_project_lite::pin_project;
 use tantivy::directory::{AntiCallToken, TerminatingWrite};
@@ -35,11 +36,12 @@ impl Writer {
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.rt.block_on(async { self.writer.write(buf).await })
+        self.rt
+            .block_on_place(async { self.writer.write(buf).await })
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.rt.block_on(async { self.writer.flush().await })
+        self.rt.block_on_place(async { self.writer.flush().await })
     }
 }
 
@@ -69,6 +71,6 @@ impl AsyncWrite for Writer {
 impl TerminatingWrite for Writer {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
         // TODO(MLB): flush as well?
-        self.rt.clone().block_on(self.shutdown())
+        self.rt.clone().block_on_place(self.shutdown())
     }
 }

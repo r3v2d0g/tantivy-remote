@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tokio::runtime::Handle::block_on", reason = "Use `HandleExt::block_on_place` instead" }
+]

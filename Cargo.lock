@@ -124,6 +124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-on-place"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eea949e74877d876f5df420c331c841725b616a025edd7362f46175c18ca2fbc"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bon"
 version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2450,6 +2460,7 @@ name = "tantivy-remote"
 version = "0.2.4"
 dependencies = [
  "async-trait",
+ "block-on-place",
  "derive_more",
  "eyre",
  "gxhash",

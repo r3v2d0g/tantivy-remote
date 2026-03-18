@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use block_on_place::HandleExt;
 use derive_more::Debug;
 use eyre::Result;
 use sqlx::PgPool;
@@ -143,7 +144,7 @@ impl RemoteDirectory {
 
 impl Directory for RemoteDirectory {
     fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        self.rt.block_on(async {
+        self.rt.block_on_place(async {
             let path = filepath.try_to_str::<OpenReadError>()?;
             let filepath = self.path(filepath);
 
@@ -192,7 +193,7 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<DeleteError>()?;
         let deleted = self
             .rt
-            .block_on(self.metadata.delete_file(path))
+            .block_on_place(self.metadata.delete_file(path))
             .map_err(DeleteError::wrapper(filepath))?;
 
         if !deleted {
@@ -210,12 +211,12 @@ impl Directory for RemoteDirectory {
         if filepath == *META_JSON || filepath == *MANAGED_JSON {
             return self
                 .rt
-                .block_on(self.metadata.metadata_exists(path))
+                .block_on_place(self.metadata.metadata_exists(path))
                 .map_err(OpenReadError::wrapper(filepath));
         }
 
         self.rt
-            .block_on(self.metadata.file_exists(path))
+            .block_on_place(self.metadata.file_exists(path))
             .map_err(OpenReadError::wrapper(filepath))
     }
 
@@ -224,7 +225,7 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<OpenWriteError>()?;
         let exists = self
             .rt
-            .block_on(self.metadata.file_exists(path))
+            .block_on_place(self.metadata.file_exists(path))
             .map_err(OpenWriteError::wrapper(filepath))?;
 
         if exists {
@@ -234,7 +235,7 @@ impl Directory for RemoteDirectory {
         let filepath = self.path(filepath);
         let path = filepath.try_to_str::<OpenWriteError>()?;
 
-        let writer = self.rt.block_on(async {
+        let writer = self.rt.block_on_place(async {
             let mut writer = self.operator.writer_with(path).append(false);
             if let Some(chunks) = self.write_chunks {
                 writer = writer.chunk(chunks);
@@ -272,7 +273,7 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<OpenReadError>()?;
 
         self.rt
-            .block_on(self.metadata.read_metadata(path))
+            .block_on_place(self.metadata.read_metadata(path))
             .map_err(OpenReadError::wrapper(filepath))?
             .ok_or_else(|| OpenReadError::FileDoesNotExist(filepath.into()))
     }
@@ -281,12 +282,12 @@ impl Directory for RemoteDirectory {
         let path = filepath.try_to_str::<io::Error>()?;
 
         self.rt
-            .block_on(self.metadata.write_metadata(path, data))
+            .block_on_place(self.metadata.write_metadata(path, data))
             .map_err(io::Error::wrapper(filepath))
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        let flushed = self.rt.block_on(self.cache.sync());
+        let flushed = self.rt.block_on_place(self.cache.sync());
         if flushed.is_empty() {
             return Ok(());
         }
@@ -301,7 +302,7 @@ impl Directory for RemoteDirectory {
             let path = filepath.try_to_str::<io::Error>()?;
 
             self.rt
-                .block_on(self.metadata.create_file(path))
+                .block_on_place(self.metadata.create_file(path))
                 .map_err(io::Error::wrapper(filepath))?;
         }
 

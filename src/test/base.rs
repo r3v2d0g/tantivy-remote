@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::RemoteDirectory;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn basic() {
     let service = Memory::default();
     let operator = Operator::new(service)
@@ -24,16 +24,16 @@ async fn basic() {
         .await
         .expect("failed to connect to database");
 
-    let cleanup = sqlx::query!(
+    let cleanup = sqlx::query(
         r#"
         DELETE
         FROM tantivy.metadata
         WHERE index = $1
         "#,
-        index,
     );
 
     cleanup
+        .bind(index)
         .execute(&pool)
         .await
         .expect("failed to clean up metadata");

@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use block_on_place::HandleExt;
 use opendal::Metadata;
 use tantivy::{
     HasLen,
@@ -60,7 +61,7 @@ impl File {
 #[async_trait]
 impl FileHandle for File {
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        self.rt.block_on(self.read_bytes_async(range))
+        self.rt.block_on_place(self.read_bytes_async(range))
     }
 
     async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {

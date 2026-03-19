@@ -46,7 +46,7 @@ impl File {
         operator: Operator,
         chunks: Option<usize>,
         concurrency: Option<usize>,
-    ) -> Arc<dyn FileHandle> {
+    ) -> Arc<Self> {
         Arc::new(Self {
             rt,
             operator,
@@ -55,6 +55,12 @@ impl File {
             chunks,
             concurrency,
         })
+    }
+
+    /// Returns the path of the file.
+    #[inline]
+    pub fn path(&self) -> &str {
+        &self.path
     }
 }
 

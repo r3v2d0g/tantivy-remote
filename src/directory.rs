@@ -140,53 +140,59 @@ impl RemoteDirectory {
         base.push(path);
         base
     }
+
+    /// Opens the file at `filepath` for reading, returning a [`File`] handle for it.
+    pub async fn get_file(&self, filepath: &Path) -> Result<Arc<File>, OpenReadError> {
+        let path = filepath.try_to_str::<OpenReadError>()?;
+        let filepath = self.path(filepath);
+
+        if let Some(file) = self.cache.get_file(&filepath).await {
+            return Ok(file);
+        }
+
+        // We haven't already opened the file, so we need to validate that it exists.
+        let exists = if self.cache.is_created(&filepath).await {
+            true
+        } else {
+            self.metadata
+                .file_exists(path)
+                .await
+                .map_err(OpenReadError::wrapper(path))?
+        };
+
+        if !exists {
+            return Err(OpenReadError::FileDoesNotExist(path.into()));
+        }
+
+        let open = async || {
+            let metadata = self
+                .cache
+                .metadata(&filepath, || self.operator.metadata(&filepath))
+                .await?;
+
+            let path = filepath.try_to_str::<OpenReadError>()?;
+            let file = File::open(
+                path,
+                metadata,
+                self.rt.clone(),
+                self.operator.clone(),
+                self.read_chunks,
+                self.read_concurrency,
+            );
+
+            Ok(file)
+        };
+
+        self.cache.file(&filepath, open).await
+    }
 }
 
 impl Directory for RemoteDirectory {
+    #[inline]
     fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        self.rt.block_on_place(async {
-            let path = filepath.try_to_str::<OpenReadError>()?;
-            let filepath = self.path(filepath);
+        let file = self.rt.block_on_place(self.get_file(filepath))?;
 
-            if let Some(file) = self.cache.get_file(&filepath).await {
-                return Ok(file);
-            }
-
-            // We haven't already opened the file, so we need to validate that it exists.
-            let exists = if self.cache.is_created(&filepath).await {
-                true
-            } else {
-                self.metadata
-                    .file_exists(path)
-                    .await
-                    .map_err(OpenReadError::wrapper(path))?
-            };
-
-            if !exists {
-                return Err(OpenReadError::FileDoesNotExist(path.into()));
-            }
-
-            let open = async || {
-                let metadata = self
-                    .cache
-                    .metadata(&filepath, || self.operator.metadata(&filepath))
-                    .await?;
-
-                let path = filepath.try_to_str::<OpenReadError>()?;
-                let file = File::open(
-                    path,
-                    metadata,
-                    self.rt.clone(),
-                    self.operator.clone(),
-                    self.read_chunks,
-                    self.read_concurrency,
-                );
-
-                Ok(file)
-            };
-
-            self.cache.file(&filepath, open).await
-        })
+        Ok(file)
     }
 
     fn delete(&self, filepath: &Path) -> Result<(), DeleteError> {

@@ -6,12 +6,9 @@ use std::{
 use derive_more::Deref;
 use opendal::Metadata;
 use scc::hash_map::Entry;
-use tantivy::directory::{
-    FileHandle,
-    error::{OpenReadError, OpenWriteError},
-};
+use tantivy::directory::error::{OpenReadError, OpenWriteError};
 
-use crate::utils::FastConcurrentMap;
+use crate::{File, utils::FastConcurrentMap};
 
 // TODO(MLB): clean up the cache when a file is closed/after some time?
 
@@ -55,7 +52,7 @@ pub(crate) struct CreatedEntry {
 #[derive(Debug, Default, Deref)]
 pub(crate) struct FilesCache {
     #[deref]
-    cache: FastConcurrentMap<PathBuf, Arc<dyn FileHandle>>,
+    cache: FastConcurrentMap<PathBuf, Arc<File>>,
 }
 
 /// Caches the [`Metadata`]s which have been fetched.
@@ -66,9 +63,9 @@ struct MetadataCache {
 }
 
 impl Cache {
-    /// Gets the [`FileHandle`] for the given path from the cache, returning `None` if
-    /// it is not cached.
-    pub async fn get_file(&self, path: &Path) -> Option<Arc<dyn FileHandle>> {
+    /// Gets the [`File`] for the given path from the cache, returning `None` if it is
+    /// not cached.
+    pub async fn get_file(&self, path: &Path) -> Option<Arc<File>> {
         self.files
             .read_async(path, |_, file| Arc::clone(file))
             .await
@@ -84,13 +81,13 @@ impl Cache {
         self.metadata.fetch(path, fetch).await
     }
 
-    /// Fetches the [`FileHandle`] for the given path from the cache, opening it and
+    /// Fetches the [`File`] for the given path from the cache, opening it and
     /// populating the cache using the provided closure if it is not already cached.
     pub async fn file(
         &self,
         path: &Path,
-        open: impl AsyncFnOnce() -> Result<Arc<dyn FileHandle>, OpenReadError>,
-    ) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        open: impl AsyncFnOnce() -> Result<Arc<File>, OpenReadError>,
+    ) -> Result<Arc<File>, OpenReadError> {
         // fast path: try to get the file handle from the cache – this does not lock other
         //            readers.
         if let Some(file) = self.get_file(path).await {

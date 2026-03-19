@@ -6,7 +6,7 @@ mod operator;
 mod utils;
 mod writer;
 
-pub use self::directory::RemoteDirectory;
+pub use self::{directory::RemoteDirectory, file::File};
 
 #[cfg(test)]
 mod test;

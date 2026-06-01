@@ -1,12 +1,18 @@
 [package]
 name = "tantivy-remote"
 description = "tantivy with opendal and sqlx"
-version = "0.4.0"
+version = "0.4.1"
 homepage = "https://github.com/r3v2d0g/tantivy-remote"
 documentation = "https://docs.rs/tantivy-remote"
 license = "MPL-2.0"
 authors = ["Matthieu (MLB) Le brazidec <r3v2d0g@jesus.gg>"]
 edition = "2024"
+
+# `gxhash` requires the `aes` and `sse2` target features, which docs.rs does not
+# enable by default (it does not pass `-C target-cpu=native`). Without this, the
+# docs.rs build fails with a `compile_error!` from gxhash.
+[package.metadata.docs.rs]
+rustc-args = ["-C", "target-feature=+aes,+sse2"]
 
 [features]
 # This makes `block-on-place` trace all calls to one of the crate's blocking

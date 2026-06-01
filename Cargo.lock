@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "tantivy-remote"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "block-on-place",

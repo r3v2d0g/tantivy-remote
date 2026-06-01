@@ -10,7 +10,7 @@ use tantivy::{
 use tokio::task;
 use uuid::Uuid;
 
-use crate::RemoteDirectory;
+use crate::FullDirectory;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn basic() {
@@ -38,7 +38,7 @@ async fn basic() {
         .await
         .expect("failed to clean up metadata");
 
-    let directory = RemoteDirectory::open(index, operator, pool)
+    let directory = FullDirectory::open(index, operator, pool)
         .await
         .expect("failed to open directory");
 

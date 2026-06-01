@@ -14,7 +14,7 @@ use tantivy::{
 };
 use tokio::runtime::Handle;
 
-use crate::operator::Operator;
+use crate::{context::Context, operator::Operator};
 
 /// A [`FileHandle`] implementation for remote files, with automatic caching.
 #[derive(Clone)]
@@ -44,16 +44,15 @@ impl File {
         metadata: Arc<Metadata>,
         rt: Handle,
         operator: Operator,
-        chunks: Option<usize>,
-        concurrency: Option<usize>,
+        context: &Context,
     ) -> Arc<Self> {
         Arc::new(Self {
             rt,
             operator,
             path: path.into(),
             metadata,
-            chunks,
-            concurrency,
+            chunks: context.read_chunks,
+            concurrency: context.read_concurrency,
         })
     }
 

@@ -3,6 +3,22 @@
 An implementation of `tantivy`'s `Directory` that uses `opendal` and `sqlx`, the
 former for the data, and the latter for the metadata.
 
+## Logically empty files
+
+When `tantivy` writes a segment, some `SegmentComponent`s end up holding no data
+(e.g. `.pos` when no field records positions, `.fast` when there is no fast field,
+`.fieldnorm` when no field has fieldnorms). Such a file is not byte-empty — it still
+contains a small structural header and `tantivy`'s footer — but it encodes the
+*default*/empty value for its component, so its bytes are constant for a given
+`tantivy` version.
+
+These *logically empty* files are recognized on write (see `src/empty.rs`), flagged
+as such in PostgreSQL (the `is_empty` column on `tantivy.files`), and **not** written
+to the object store (`FullDirectory`) or the inner `Directory` (`LightDirectory`). On
+read they are reconstructed from an in-memory constant instead of hitting the backing
+store. Matching against the exact captured bytes means a future `tantivy` format
+change simply disables the optimization rather than risking corruption.
+
 ## Roadmap
 
 We plan on implementing the following features:

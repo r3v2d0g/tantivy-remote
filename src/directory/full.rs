@@ -18,11 +18,12 @@ use crate::{
     cache::Cache,
     context::Context,
     directory::is_metadata,
+    empty::Empty,
     file::File,
     metadata::MetadataStore,
     operator::Operator,
     utils::{PathExt, WrapIoErrorExt},
-    writer::Writer,
+    writer::{OnDone, OpenSink, OpendalSink, Writer},
 };
 
 /// A [`Directory`] implementation that reads and writes files to a remote object
@@ -125,26 +126,38 @@ impl FullDirectory {
     /// Opens the file at `filepath` for reading, returning a [`File`] handle for it.
     pub async fn get_file(&self, filepath: &Path) -> Result<Arc<File>, OpenReadError> {
         let path = filepath.try_to_str::<OpenReadError>()?;
-        let filepath = self.context.path(filepath);
+        let prefixed = self.context.path(filepath);
 
-        if let Some(file) = self.cache.get_file(&filepath).await {
+        if let Some(file) = self.cache.get_file(&prefixed).await {
             return Ok(file);
         }
 
-        // We haven't already opened the file, so we need to validate that it exists.
-        let exists = if self.cache.is_created(&filepath).await {
-            true
-        } else {
-            self.metadata
-                .file_exists(path)
+        // We haven't already opened the file, so we need to validate that it exists and
+        // figure out whether it is logically empty (created this session, or recorded as
+        // such in the metadata store).
+        let empty = match self.cache.created_state(&prefixed).await {
+            Some(state) => state.empty,
+            None => match self
+                .metadata
+                .file_lookup(path)
                 .await
                 .map_err(OpenReadError::wrapper(path))?
+            {
+                None => return Err(OpenReadError::FileDoesNotExist(path.into())),
+                Some(true) => Empty::for_path(filepath),
+                Some(false) => None,
+            },
         };
 
-        if !exists {
-            return Err(OpenReadError::FileDoesNotExist(path.into()));
+        // Logically empty files are reconstructed from memory instead of being read from
+        // the object store, where their bytes were never written.
+        if let Some(empty) = empty {
+            let path = prefixed.to_string_lossy().into_owned();
+            let file = File::memory(path, empty.bytes());
+            return self.cache.file(&prefixed, async || Ok(file)).await;
         }
 
+        let filepath = prefixed;
         let open = async || {
             let metadata = self
                 .cache
@@ -207,52 +220,58 @@ impl Directory for FullDirectory {
     }
 
     fn open_write(&self, filepath: &Path) -> Result<WritePtr, OpenWriteError> {
-        // We first have to make sure that the file does not already exist.
+        // We first have to make sure that the file does not already exist, then register
+        // it as created so it is visible before the directory is synced.
         let path = filepath.try_to_str::<OpenWriteError>()?;
-        let exists = self
-            .rt
-            .block_on_place(self.metadata.file_exists(path))
-            .map_err(OpenWriteError::wrapper(filepath))?;
+        let mut entry = self.rt.block_on_place(async {
+            let exists = self
+                .metadata
+                .file_exists(path)
+                .await
+                .map_err(OpenWriteError::wrapper(filepath))?;
 
-        if exists {
-            return Err(OpenWriteError::FileAlreadyExists(filepath.into()));
-        }
-
-        let filepath = self.context.path(filepath);
-        let path = filepath.try_to_str::<OpenWriteError>()?;
-
-        let writer = self.rt.block_on_place(async {
-            let mut writer = self.operator.writer_with(path).append(false);
-            if let Some(chunks) = self.context.write_chunks {
-                writer = writer.chunk(chunks);
+            if exists {
+                return Err(OpenWriteError::FileAlreadyExists(filepath.into()));
             }
 
-            if let Some(concurrency) = self.context.write_concurrency {
-                writer = writer.concurrent(concurrency);
-            }
-
-            let writer = match writer.await {
-                Ok(writer) => writer,
-                Err(error) => {
-                    let filepath = filepath.to_path_buf();
-                    if error.kind() == opendal::ErrorKind::AlreadyExists {
-                        return Err(OpenWriteError::FileAlreadyExists(filepath));
-                    } else {
-                        return Err(OpenWriteError::wrap_other(error, filepath));
-                    }
-                }
-            };
-
-            let filepath = filepath.to_path_buf();
-            let entry = self.cache.created(filepath).await?;
-
-            Ok(Writer::new(entry, writer, self.rt.clone()))
+            self.cache.created(self.context.path(filepath)).await
         })?;
 
-        let writer = Box::new(writer);
-        let ptr = WritePtr::new(writer);
+        let prefixed = self.context.path(filepath);
+        let path = prefixed.to_string_lossy().into_owned();
 
-        Ok(ptr)
+        // The object-store writer is opened lazily: a logically empty file never opens
+        // it, so its (default) bytes are never sent to the object store.
+        let operator = self.operator.clone();
+        let rt = self.rt.clone();
+        let chunks = self.context.write_chunks;
+        let concurrency = self.context.write_concurrency;
+
+        let open: OpenSink = Box::new(move || {
+            rt.clone().block_on_place(async {
+                let mut writer = operator.writer_with(&path).append(false);
+                if let Some(chunks) = chunks {
+                    writer = writer.chunk(chunks);
+                }
+
+                if let Some(concurrency) = concurrency {
+                    writer = writer.concurrent(concurrency);
+                }
+
+                let writer = writer.await.map_err(io::Error::other)?;
+                Ok(OpendalSink::boxed(writer, rt.clone()))
+            })
+        });
+
+        // Once finalized, record on the cache entry whether the file was empty, so that
+        // `sync_directory` can persist that to the metadata store.
+        let on_done: OnDone = Box::new(move |empty| {
+            entry.done(empty);
+            Ok(())
+        });
+
+        let writer = Writer::new(prefixed, open, on_done);
+        Ok(WritePtr::new(Box::new(writer)))
     }
 
     fn atomic_read(&self, filepath: &Path) -> Result<Vec<u8>, OpenReadError> {
@@ -273,7 +292,7 @@ impl Directory for FullDirectory {
             return Ok(());
         }
 
-        for path in flushed {
+        for (path, empty) in flushed {
             // We have to remove the first part of the path, as it contains the index ID, which
             // we don't include in PSQL.
             let mut components = path.components();
@@ -283,7 +302,7 @@ impl Directory for FullDirectory {
             let path = filepath.try_to_str::<io::Error>()?;
 
             self.rt
-                .block_on_place(self.metadata.create_file(path))
+                .block_on_place(self.metadata.create_file(path, empty.is_some()))
                 .map_err(io::Error::wrapper(filepath))?;
         }
 

@@ -61,13 +61,11 @@ async fn basic() {
 
     let index_ = index.clone();
     let init = task::spawn_blocking(move || {
-        let reader = index_
+        index_
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
-            .expect("failed to create index reader");
-
-        reader
+            .expect("failed to create index reader")
     });
 
     let reader = init.await.expect("failed to initialize reader");
@@ -97,7 +95,7 @@ async fn basic() {
     let search = task::spawn_blocking(move || {
         reader_
             .searcher()
-            .search(&query_, &TopDocs::with_limit(10))
+            .search(&query_, &TopDocs::with_limit(10).order_by_score())
             .expect("failed to search")
     });
 
@@ -111,7 +109,7 @@ async fn basic() {
         reader_.reload().expect("failed to reload reader");
         reader_
             .searcher()
-            .search(&query, &TopDocs::with_limit(10))
+            .search(&query, &TopDocs::with_limit(10).order_by_score())
             .expect("failed to search")
     });
 

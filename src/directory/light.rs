@@ -17,8 +17,11 @@ use uuid::Uuid;
 use crate::{
     context::Context,
     directory::is_metadata,
+    empty::Empty,
+    file::File,
     metadata::MetadataStore,
     utils::{PathExt, WrapIoErrorExt},
+    writer::{OnDone, OpenSink, Sink, Writer},
 };
 
 /// A [`Directory`] implementation that delegates to an inner [`Directory`] for
@@ -120,14 +123,52 @@ impl<D> LightDirectory<D> {
 }
 
 impl<D: Directory + Clone> Directory for LightDirectory<D> {
-    #[inline]
     fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        self.inner.get_file_handle(filepath)
+        // Non-empty files live in the inner directory; logically empty files were never
+        // written there, so a miss falls back to reconstructing them from memory.
+        match self.inner.get_file_handle(filepath) {
+            Err(OpenReadError::FileDoesNotExist(_)) => (),
+            result => return result,
+        }
+
+        let path = filepath.try_to_str::<OpenReadError>()?;
+        let is_empty = self
+            .rt
+            .block_on_place(self.metadata.file_lookup(path))
+            .map_err(OpenReadError::wrapper(filepath))?;
+
+        match is_empty {
+            // Reconstruct the logically empty file's bytes from memory.
+            Some(true) => {
+                let empty = Empty::for_path(filepath)
+                    .ok_or_else(|| OpenReadError::FileDoesNotExist(filepath.into()))?;
+                Ok(File::memory(path, empty.bytes()))
+            }
+            // `Some(false)` cannot happen (only empty files are tracked here), and `None`
+            // means the file genuinely does not exist.
+            _ => Err(OpenReadError::FileDoesNotExist(filepath.into())),
+        }
     }
 
-    #[inline]
     fn delete(&self, filepath: &Path) -> Result<(), DeleteError> {
-        self.inner.delete(filepath)
+        // Logically empty files are not in the inner directory; delete them from the
+        // metadata store instead.
+        match self.inner.delete(filepath) {
+            Err(DeleteError::FileDoesNotExist(_)) => (),
+            result => return result,
+        }
+
+        let path = filepath.try_to_str::<DeleteError>()?;
+        let deleted = self
+            .rt
+            .block_on_place(self.metadata.delete_file(path))
+            .map_err(DeleteError::wrapper(filepath))?;
+
+        if deleted {
+            Ok(())
+        } else {
+            Err(DeleteError::FileDoesNotExist(filepath.into()))
+        }
     }
 
     fn exists(&self, filepath: &Path) -> Result<bool, OpenReadError> {
@@ -139,12 +180,47 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
                 .map_err(OpenReadError::wrapper(filepath));
         }
 
-        self.inner.exists(filepath)
+        if self.inner.exists(filepath)? {
+            return Ok(true);
+        }
+
+        // It might be a logically empty file, tracked only in the metadata store.
+        let path = filepath.try_to_str::<OpenReadError>()?;
+        let found = self
+            .rt
+            .block_on_place(self.metadata.file_lookup(path))
+            .map_err(OpenReadError::wrapper(filepath))?;
+
+        Ok(found.is_some())
     }
 
-    #[inline]
     fn open_write(&self, filepath: &Path) -> Result<WritePtr, OpenWriteError> {
-        self.inner.open_write(filepath)
+        // The inner writer is opened lazily: a logically empty file is never written to
+        // the inner directory and is recorded in the metadata store instead.
+        let inner = self.inner.clone();
+        let target = filepath.to_path_buf();
+        let open: OpenSink = Box::new(move || {
+            let writer = inner.open_write(&target).map_err(io::Error::other)?;
+            Ok(Box::new(writer) as Sink)
+        });
+
+        let metadata = self.metadata.clone();
+        let rt = self.rt.clone();
+        let path = filepath.to_path_buf();
+
+        let on_done: OnDone = Box::new(move |empty| {
+            // Only empty files need recording; non-empty ones live in the inner directory.
+            if empty.is_some() {
+                let path = path.try_to_str::<io::Error>()?;
+                rt.block_on_place(metadata.create_file(path, true))
+                    .map_err(io::Error::other)?;
+            }
+
+            Ok(())
+        });
+
+        let writer = Writer::new(filepath.to_path_buf(), open, on_done);
+        Ok(WritePtr::new(Box::new(writer)))
     }
 
     fn atomic_read(&self, filepath: &Path) -> Result<Vec<u8>, OpenReadError> {

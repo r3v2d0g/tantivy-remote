@@ -7,15 +7,6 @@ pub trait WrapIoErrorExt: Sized {
     /// Wraps the given [`io::Error`].
     fn wrap(error: io::Error, path: impl Into<PathBuf>) -> Self;
 
-    /// Creates an [`io::Error`] from the given error and wraps it.
-    fn wrap_other(
-        error: impl Into<Box<dyn error::Error + Send + Sync>>,
-        path: impl Into<PathBuf>,
-    ) -> Self {
-        let error = io::Error::other(error);
-        Self::wrap(error, path)
-    }
-
     /// Returns a closure that will wrap an error.
     fn wrapper<E>(path: impl Into<PathBuf>) -> impl Fn(E) -> Self
     where

@@ -54,9 +54,17 @@ impl MetadataStore {
     /// Returns `true` if there is a non-metadata file with the given path that exists
     /// in the metadata store.
     pub async fn file_exists(&self, path: &str) -> sqlx::Result<bool> {
+        Ok(self.file_lookup(path).await?.is_some())
+    }
+
+    /// Looks up a non-metadata file by path, returning whether it is [logically
+    /// empty][1] if it exists (and has not been deleted), or `None` otherwise.
+    ///
+    /// [1]: crate::empty
+    pub async fn file_lookup(&self, path: &str) -> sqlx::Result<Option<bool>> {
         let query = sqlx::query_scalar(
             r#"
-            SELECT 1
+            SELECT is_empty
             FROM tantivy.files
             WHERE index = $1
               AND path = $2
@@ -64,21 +72,24 @@ impl MetadataStore {
             "#,
         );
 
-        let row: Option<i32> = query
+        query
             .bind(self.context.index)
             .bind(path)
             .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row.is_some())
+            .await
     }
 
     /// Creates the non-metadata file into the metadata store.
-    pub async fn create_file(&self, path: &str) -> sqlx::Result<()> {
+    ///
+    /// `is_empty` records whether the file was detected to be [logically empty][1] and
+    /// therefore not stored in the object store / inner directory.
+    ///
+    /// [1]: crate::empty
+    pub async fn create_file(&self, path: &str, is_empty: bool) -> sqlx::Result<()> {
         let create = sqlx::query(
             r#"
-            INSERT INTO tantivy.files (index, path)
-            VALUES ($1, $2)
+            INSERT INTO tantivy.files (index, path, is_empty)
+            VALUES ($1, $2, $3)
             ON CONFLICT DO NOTHING
             "#,
         );
@@ -86,6 +97,7 @@ impl MetadataStore {
         create
             .bind(self.context.index)
             .bind(path)
+            .bind(is_empty)
             .execute(&self.pool)
             .await?;
 

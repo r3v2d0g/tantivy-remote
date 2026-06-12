@@ -8,7 +8,7 @@ use opendal::Metadata;
 use scc::hash_map::Entry;
 use tantivy::directory::error::{OpenReadError, OpenWriteError};
 
-use crate::{File, utils::FastConcurrentMap};
+use crate::{File, empty::Empty, utils::FastConcurrentMap};
 
 // TODO(MLB): clean up the cache when a file is closed/after some time?
 
@@ -31,13 +31,26 @@ pub(crate) struct Cache {
 /// containing them is synced.
 #[derive(Debug, Default, Deref)]
 struct CreatedCache {
-    /// Contains, for each path created, whether the file has been flushed and closed.
+    /// Contains, for each path created, its current [`CreatedState`].
     #[deref]
-    cache: FastConcurrentMap<PathBuf, bool>,
+    cache: FastConcurrentMap<PathBuf, CreatedState>,
 }
 
-/// An entry into the cache of created files, used to save that the file has been
-/// flushed.
+/// The state of a created-but-not-yet-synced file.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CreatedState {
+    /// Whether the file has been flushed and closed.
+    pub flushed: bool,
+
+    /// If the file was detected to be [logically empty][1], which empty representation
+    /// it is (so it can be reconstructed from memory on read).
+    ///
+    /// [1]: crate::empty
+    pub empty: Option<Empty>,
+}
+
+/// An entry into the cache of created files, used to record that the file has been
+/// flushed and whether it turned out to be empty.
 pub(crate) struct CreatedEntry {
     path: PathBuf,
     cache: Arc<CreatedCache>,
@@ -108,17 +121,23 @@ impl Cache {
         Ok(Arc::clone(entry.get()))
     }
 
-    /// Returns `true` if the file is being created and/or has been flushed but not yet
-    /// synced.
-    pub async fn is_created(&self, filepath: &Path) -> bool {
-        self.created.contains_async(filepath).await
+    /// Returns the [`CreatedState`] of the file if it is being created and/or has been
+    /// flushed but not yet synced.
+    ///
+    /// Returns `None` if it is not tracked as created.
+    pub async fn created_state(&self, filepath: &Path) -> Option<CreatedState> {
+        self.created.read_async(filepath, |_, state| *state).await
     }
 
     /// Marks the file at the given path as having been created, returning a
     /// [`CreatedEntry`] for it so that it can later be marked as having been flushed.
     pub async fn created(&self, filepath: PathBuf) -> Result<CreatedEntry, OpenWriteError> {
         let filepath = filepath.to_path_buf();
-        let result = self.created.insert_async(filepath.clone(), false).await;
+        let result = self
+            .created
+            .insert_async(filepath.clone(), CreatedState::default())
+            .await;
+
         match result {
             Ok(_) => Ok(CreatedEntry {
                 path: filepath,
@@ -131,14 +150,18 @@ impl Cache {
     }
 
     /// Iterates over all of the created files, returning the ones which have been
-    /// flushed and closed.
-    pub async fn sync(&self) -> Vec<PathBuf> {
+    /// flushed and closed, together with their [logically empty][1] representation (if
+    /// any).
+    ///
+    /// [1]: crate::empty
+    pub async fn sync(&self) -> Vec<(PathBuf, Option<Empty>)> {
         let mut flushed = vec![];
         self.created
             .iter_mut_async(|entry| {
-                if *entry {
+                if entry.flushed {
+                    let empty = entry.empty;
                     let (path, _) = entry.consume();
-                    flushed.push(path);
+                    flushed.push((path, empty));
                 }
 
                 true
@@ -150,11 +173,17 @@ impl Cache {
 }
 
 impl CreatedEntry {
-    /// Marks the file as having been flushed and closed.
-    pub fn done(&mut self) {
+    /// Marks the file as having been flushed and closed, recording its [logically
+    /// empty][1] representation if it was detected to be empty.
+    ///
+    /// [1]: crate::empty
+    pub fn done(&mut self, empty: Option<Empty>) {
         if !self.done {
             self.done = true;
-            self.cache.update_sync(&self.path, |_, done| *done = true);
+            self.cache.update_sync(&self.path, |_, state| {
+                state.flushed = true;
+                state.empty = empty;
+            });
         }
     }
 }

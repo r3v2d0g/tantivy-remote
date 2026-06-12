@@ -23,6 +23,29 @@ pub struct MetadataStore {
     pub(crate) context: Context,
 }
 
+/// What the metadata store knows about a non-metadata file: whether it is
+/// [logically empty][1] and, if it was [bundled][2], where its bytes live inside
+/// the bundle object.
+///
+/// The file is bundled iff [`byte_length`][Self::byte_length] is `Some`.
+///
+/// [1]: crate::empty
+/// [2]: crate::bundle
+/// [3]: crate::bundle::object
+#[derive(Clone, Debug)]
+pub struct FileRecord {
+    /// Whether the file is logically empty (reconstructed from memory on read).
+    pub is_empty: bool,
+
+    /// The file's byte offset within its bundle object (`0` when not bundled).
+    pub byte_offset: i64,
+
+    /// The file's byte length within its bundle object.
+    ///
+    /// `None` if the file is not bundled (its bytes are the whole object at its path).
+    pub byte_length: Option<i64>,
+}
+
 impl MetadataStore {
     /// Creates a new metadata store for the index described by `context`.
     ///
@@ -57,14 +80,12 @@ impl MetadataStore {
         Ok(self.file_lookup(path).await?.is_some())
     }
 
-    /// Looks up a non-metadata file by path, returning whether it is [logically
-    /// empty][1] if it exists (and has not been deleted), or `None` otherwise.
-    ///
-    /// [1]: crate::empty
-    pub async fn file_lookup(&self, path: &str) -> sqlx::Result<Option<bool>> {
-        let query = sqlx::query_scalar(
+    /// Looks up a non-metadata file by path, returning its [`FileRecord`] if it exists
+    /// (and has not been deleted).
+    pub async fn file_lookup(&self, path: &str) -> sqlx::Result<Option<FileRecord>> {
+        let query = sqlx::query_as(
             r#"
-            SELECT is_empty
+            SELECT is_empty, byte_offset, byte_length
             FROM tantivy.files
             WHERE index = $1
               AND path = $2
@@ -72,24 +93,48 @@ impl MetadataStore {
             "#,
         );
 
-        query
+        let Some((is_empty, byte_offset, byte_length)) = query
             .bind(self.context.index)
             .bind(path)
             .fetch_optional(&self.pool)
-            .await
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(FileRecord {
+            is_empty,
+            byte_offset,
+            byte_length,
+        }))
     }
 
-    /// Creates the non-metadata file into the metadata store.
+    /// Creates a non-metadata file in the metadata store.
     ///
     /// `is_empty` records whether the file was detected to be [logically empty][1] and
     /// therefore not stored in the object store / inner directory.
     ///
+    /// `bundle` records where the file's bytes live: `None` means the file is its own
+    /// object at its path, `Some((offset, length))` means its bytes live inside its
+    /// segment's [bundle][2] object at `[offset, offset + length)`.
+    ///
     /// [1]: crate::empty
-    pub async fn create_file(&self, path: &str, is_empty: bool) -> sqlx::Result<()> {
+    /// [2]: crate::bundle
+    pub async fn create_file(
+        &self,
+        path: &str,
+        is_empty: bool,
+        bundle: Option<(u64, u64)>,
+    ) -> sqlx::Result<()> {
+        let (byte_offset, byte_length) = match bundle {
+            Some((offset, length)) => (offset as i64, Some(length as i64)),
+            None => (0, None),
+        };
+
         let create = sqlx::query(
             r#"
-            INSERT INTO tantivy.files (index, path, is_empty)
-            VALUES ($1, $2, $3)
+            INSERT INTO tantivy.files (index, path, is_empty, byte_offset, byte_length)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT DO NOTHING
             "#,
         );
@@ -98,6 +143,8 @@ impl MetadataStore {
             .bind(self.context.index)
             .bind(path)
             .bind(is_empty)
+            .bind(byte_offset)
+            .bind(byte_length)
             .execute(&self.pool)
             .await?;
 

@@ -15,6 +15,7 @@ use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use crate::{
+    bundle::{self, Bundler},
     cache::Cache,
     context::Context,
     directory::is_metadata,
@@ -23,7 +24,7 @@ use crate::{
     metadata::MetadataStore,
     operator::Operator,
     utils::{PathExt, WrapIoErrorExt},
-    writer::{OnDone, OpenSink, OpendalSink, Writer},
+    writer::{OnDone, OpenSink, OpendalSink, Outcome, Writer},
 };
 
 /// A [`Directory`] implementation that reads and writes files to a remote object
@@ -54,6 +55,12 @@ pub struct FullDirectory {
     /// Stores the metadata for the directory and its files.
     metadata: MetadataStore,
 
+    /// Buffers bundle-eligible files until they are written as one object per segment
+    /// at sync time.
+    ///
+    /// Empty if bundling is not enabled.
+    bundle: Bundler,
+
     /// The configuration shared with the metadata store and the file handles.
     ///
     /// The metadata store keeps its own clone; the two are kept in sync by the
@@ -78,6 +85,7 @@ impl FullDirectory {
             cache: Cache::default(),
             operator: Operator::from(operator),
             metadata,
+            bundle: Bundler::default(),
             context,
         })
     }
@@ -123,6 +131,37 @@ impl FullDirectory {
         self
     }
 
+    /// Enables [bundling][1]: a segment's (non-empty, non-`.del`) component files are
+    /// concatenated into a single `<segment_uuid>.bundle` object instead of one object
+    /// per file.
+    ///
+    /// This drastically cuts the number of objects for indexes with many small segments.
+    ///
+    /// Disabled by default.
+    ///
+    /// A component file larger than [`with_bundle_max_file_bytes`][2] is left as its
+    /// own object so a large (merge) segment is never held in memory.
+    ///
+    /// [1]: crate::bundle
+    /// [2]: Self::with_bundle_max_file_bytes
+    pub fn with_bundling(mut self) -> Self {
+        self.context.bundle = true;
+        self.metadata.context.bundle = true;
+        self
+    }
+
+    /// Sets the per-file size cap for [bundling][1]: files larger than this are written
+    /// as their own object instead of being bundled.
+    ///
+    /// Default is 16 MiB.
+    ///
+    /// [1]: crate::bundle
+    pub fn with_bundle_max_file_bytes(mut self, bytes: usize) -> Self {
+        self.context.bundle_max_file_bytes = bytes;
+        self.metadata.context.bundle_max_file_bytes = bytes;
+        self
+    }
+
     /// Opens the file at `filepath` for reading, returning a [`File`] handle for it.
     pub async fn get_file(&self, filepath: &Path) -> Result<Arc<File>, OpenReadError> {
         let path = filepath.try_to_str::<OpenReadError>()?;
@@ -132,11 +171,27 @@ impl FullDirectory {
             return Ok(file);
         }
 
-        // We haven't already opened the file, so we need to validate that it exists and
-        // figure out whether it is logically empty (created this session, or recorded as
-        // such in the metadata store).
-        let empty = match self.cache.created_state(&prefixed).await {
-            Some(state) => state.empty,
+        // A bundle-eligible file that has been written but not yet synced lives only in
+        // the in-memory bundler – serve it from there.
+        if let Some(bytes) = self.bundle.get(filepath).await {
+            let path = prefixed.to_string_lossy().into_owned();
+            let file = File::memory_owned(path, bytes);
+            return self.cache.file(&prefixed, async || Ok(file)).await;
+        }
+
+        // Otherwise resolve it: created this session (standalone or empty), or recorded
+        // in the metadata store (standalone, empty, or bundled).
+        enum Source {
+            Empty(Empty),
+            Standalone,
+            Bundled { offset: u64, len: u64 },
+        }
+
+        let source = match self.cache.created_state(&prefixed).await {
+            Some(state) => match state.empty {
+                Some(empty) => Source::Empty(empty),
+                None => Source::Standalone,
+            },
             None => match self
                 .metadata
                 .file_lookup(path)
@@ -144,39 +199,62 @@ impl FullDirectory {
                 .map_err(OpenReadError::wrapper(path))?
             {
                 None => return Err(OpenReadError::FileDoesNotExist(path.into())),
-                Some(true) => Empty::for_path(filepath),
-                Some(false) => None,
+                Some(record) if record.is_empty => Source::Empty(
+                    Empty::for_path(filepath)
+                        .ok_or_else(|| OpenReadError::FileDoesNotExist(path.into()))?,
+                ),
+                Some(record) => match record.byte_length {
+                    Some(len) => Source::Bundled {
+                        offset: record.byte_offset as u64,
+                        len: len as u64,
+                    },
+                    None => Source::Standalone,
+                },
             },
         };
 
-        // Logically empty files are reconstructed from memory instead of being read from
-        // the object store, where their bytes were never written.
-        if let Some(empty) = empty {
-            let path = prefixed.to_string_lossy().into_owned();
-            let file = File::memory(path, empty.bytes());
-            return self.cache.file(&prefixed, async || Ok(file)).await;
-        }
+        let open = async || match source {
+            // Logically empty: reconstructed from memory, never read from the store.
+            Source::Empty(empty) => {
+                let path = prefixed.to_string_lossy().into_owned();
+                Ok(File::memory(path, empty.bytes()))
+            }
 
-        let filepath = prefixed;
-        let open = async || {
-            let metadata = self
-                .cache
-                .metadata(&filepath, || self.operator.metadata(&filepath))
-                .await?;
+            // Bundled: a byte range of the segment's bundle object.
+            Source::Bundled { offset, len } => {
+                let object = bundle::object(filepath)
+                    .ok_or_else(|| OpenReadError::FileDoesNotExist(path.into()))?;
+                let object = self.context.path(object);
+                let object = object.to_string_lossy().into_owned();
+                Ok(File::bundled(
+                    object,
+                    offset,
+                    len,
+                    self.rt.clone(),
+                    self.operator.clone(),
+                    &self.context,
+                ))
+            }
 
-            let path = filepath.try_to_str::<OpenReadError>()?;
-            let file = File::open(
-                path,
-                metadata,
-                self.rt.clone(),
-                self.operator.clone(),
-                &self.context,
-            );
+            // Standalone: the whole object at the file's own path.
+            Source::Standalone => {
+                let path = prefixed.to_string_lossy().into_owned();
+                let metadata = self
+                    .cache
+                    .metadata(&prefixed, || self.operator.metadata(&prefixed))
+                    .await?;
 
-            Ok(file)
+                Ok(File::open(
+                    path,
+                    metadata.content_length(),
+                    self.rt.clone(),
+                    self.operator.clone(),
+                    &self.context,
+                ))
+            }
         };
 
-        self.cache.file(&filepath, open).await
+        self.cache.file(&prefixed, open).await
     }
 }
 
@@ -240,8 +318,8 @@ impl Directory for FullDirectory {
         let prefixed = self.context.path(filepath);
         let path = prefixed.to_string_lossy().into_owned();
 
-        // The object-store writer is opened lazily: a logically empty file never opens
-        // it, so its (default) bytes are never sent to the object store.
+        // The object-store writer is opened lazily: a logically empty or bundled file
+        // never opens it, so its bytes are never sent to the object store individually.
         let operator = self.operator.clone();
         let rt = self.rt.clone();
         let chunks = self.context.write_chunks;
@@ -263,14 +341,34 @@ impl Directory for FullDirectory {
             })
         });
 
-        // Once finalized, record on the cache entry whether the file was empty, so that
-        // `sync_directory` can persist that to the metadata store.
-        let on_done: OnDone = Box::new(move |empty| {
-            entry.done(empty);
+        // When bundling, a small bundle-eligible file is buffered (not streamed) and
+        // bundled at sync; everything else behaves as without bundling.
+        let eligible = self.context.bundle && bundle::is_bundleable(filepath);
+        let cap = if eligible {
+            self.context.bundle_max_file_bytes
+        } else {
+            Empty::max_len()
+        };
+
+        // Once finalized, record the outcome so `sync_directory` can persist it: empty /
+        // standalone files stay on the cache entry; bundled bytes go to the bundler.
+        let bundler = self.bundle.clone();
+        let rt = self.rt.clone();
+        let relative = filepath.to_path_buf();
+        let on_done: OnDone = Box::new(move |outcome| {
+            match outcome {
+                Outcome::Empty(empty) => entry.done(Some(empty)),
+                Outcome::Standalone => entry.done(None),
+                Outcome::Bundled(bytes) => {
+                    entry.remove();
+                    rt.block_on_place(bundler.buffer(relative, bytes));
+                }
+            }
+
             Ok(())
         });
 
-        let writer = Writer::new(prefixed, open, on_done);
+        let writer = Writer::new(prefixed, cap, eligible, open, on_done);
         Ok(WritePtr::new(Box::new(writer)))
     }
 
@@ -287,14 +385,9 @@ impl Directory for FullDirectory {
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        let flushed = self.rt.block_on_place(self.cache.sync());
-        if flushed.is_empty() {
-            return Ok(());
-        }
-
-        for (path, empty) in flushed {
-            // We have to remove the first part of the path, as it contains the index ID, which
-            // we don't include in PSQL.
+        // Standalone and empty files: record each in the metadata store. The cache keys
+        // are prefixed with the index ID, which we strip before storing.
+        for (path, empty) in self.rt.block_on_place(self.cache.sync()) {
             let mut components = path.components();
             components.next();
 
@@ -302,8 +395,33 @@ impl Directory for FullDirectory {
             let path = filepath.try_to_str::<io::Error>()?;
 
             self.rt
-                .block_on_place(self.metadata.create_file(path, empty.is_some()))
+                .block_on_place(self.metadata.create_file(path, empty.is_some(), None))
                 .map_err(io::Error::wrapper(filepath))?;
+        }
+
+        // Bundled files: write one object per segment, then record each component's byte
+        // range. The bundler is keyed by index-relative paths.
+        for bundle in self.rt.block_on_place(self.bundle.drain()) {
+            let object = self.context.path(&bundle.path);
+            let object = object.try_to_str::<io::Error>()?;
+
+            self.rt.block_on_place(async {
+                let mut writer = self.operator.writer_with(object).append(false).await?;
+                writer.write_from(bundle.bytes.as_slice()).await?;
+                writer.close().await?;
+                io::Result::Ok(())
+            })?;
+
+            for entry in bundle.entries {
+                let path = entry.path.try_to_str::<io::Error>()?;
+                self.rt
+                    .block_on_place(self.metadata.create_file(
+                        path,
+                        false,
+                        Some((entry.offset, entry.length)),
+                    ))
+                    .map_err(io::Error::wrapper(&entry.path))?;
+            }
         }
 
         // TODO(MLB): remove from the cache

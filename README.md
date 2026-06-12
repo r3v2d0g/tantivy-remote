@@ -19,6 +19,22 @@ read they are reconstructed from an in-memory constant instead of hitting the ba
 store. Matching against the exact captured bytes means a future `tantivy` format
 change simply disables the optimization rather than risking corruption.
 
+## Segment bundling (optional)
+
+An index with many small segments produces a huge number of tiny objects (one
+per `SegmentComponent`), which is expensive to write and read over an object
+store. With bundling enabled, a segment's non-empty, non-`.del` component files
+are buffered in memory as they are written and, at `sync_directory`,
+concatenated into a single `<segment_uuid>.bundle` object. Each component then
+lives at a byte range inside that object recorded in PostgreSQL. On read, a
+bundled component is served as a sub-range of its bundle object.
+
+`.del` files are never bundled (they are mutable and written after the segment),
+and a component larger than `with_bundle_max_file_bytes` (default 16 MiB) stays
+a standalone object so a large merge segment is never held in memory. Bundling
+composes with the logically-empty optimization above: empty components are
+skipped, not bundled..
+
 ## Roadmap
 
 We plan on implementing the following features:

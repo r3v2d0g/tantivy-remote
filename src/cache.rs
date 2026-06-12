@@ -186,6 +186,20 @@ impl CreatedEntry {
             });
         }
     }
+
+    /// Removes the created entry entirely, without marking it flushed.
+    ///
+    /// Used for [bundled][1] files, which are tracked by the [bundler][2] instead of the
+    /// created cache, so `sync_directory` must not also see them here.
+    ///
+    /// [1]: crate::bundle
+    /// [2]: crate::bundle::Bundler
+    pub fn remove(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.cache.remove_sync(&self.path);
+        }
+    }
 }
 
 impl MetadataCache {

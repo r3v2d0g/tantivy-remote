@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     io::{self, Write},
     mem,
     path::PathBuf,
@@ -28,31 +29,56 @@ pub(crate) type Sink = Box<dyn TerminatingWrite + Send + Sync>;
 /// empty files never open anything downstream.
 pub(crate) type OpenSink = Box<dyn FnOnce() -> io::Result<Sink> + Send + Sync>;
 
-/// Called exactly once when the file is finalized, with `Some` if it was detected
-/// to be [logically empty][1] (and thus *not* written downstream).
-///
-/// [1]: crate::empty
-pub(crate) type OnDone = Box<dyn FnOnce(Option<Empty>) -> io::Result<()> + Send + Sync>;
+/// Called exactly once when the file is finalized, with the [`Outcome`] of buffering it.
+pub(crate) type OnDone = Box<dyn FnOnce(Outcome) -> io::Result<()> + Send + Sync>;
 
-/// A [`TerminatingWrite`] that defers the decision of whether a segment-component
-/// file is [logically empty][1] until it is finalized.
+/// How a finalized file was handled, reported to [`OnDone`].
+pub(crate) enum Outcome {
+    /// The file was [logically empty][1]: nothing was written downstream.
+    ///
+    /// [1]: crate::empty
+    Empty(Empty),
+
+    /// The file's bytes were written to the downstream [`Sink`] as their own object.
+    Standalone,
+
+    /// The file is [bundle][1]-eligible and was small enough to buffer entirely: its
+    /// bytes are handed back here to be bundled at sync time, and nothing was written
+    /// downstream.
+    ///
+    /// [1]: crate::bundle
+    Bundled(Vec<u8>),
+}
+
+/// A [`TerminatingWrite`] that defers, until the file is finalized, the decision of how
+/// to store a segment-component file.
 ///
-/// It buffers up to [`Empty::max_len`] bytes in memory. If the file is closed while
-/// still within that cap *and* its bytes are exactly the empty serialization for its
-/// component, it is logically empty: the downstream sink is never opened, and [`OnDone`]
-/// is invoked with the matching [`Empty`]. Otherwise the buffer is flushed to the
-/// downstream sink (opened lazily), any further bytes are streamed straight through, and
-/// [`OnDone`] is invoked with `None`.
+/// It buffers up to `cap` bytes in memory, then at finalization:
+/// - if the bytes are exactly the [logically empty][1] serialization for the component,
+///   nothing is written downstream ([`Outcome::Empty`]);
+/// - else if the file is [bundle][2]-eligible and stayed within `cap`, the buffered bytes
+///   are handed back to be bundled ([`Outcome::Bundled`]);
+/// - else the buffer is flushed to the downstream sink (opened lazily) and any further
+///   bytes are streamed straight through ([`Outcome::Standalone`]).
+///
+/// With bundling disabled, `cap` is just [`Empty::max_len`] and the bundle branch is
+/// never taken, so only the empty/standalone outcomes occur.
 ///
 /// [1]: crate::empty
+/// [2]: crate::bundle
 pub(crate) struct Writer {
     /// The (index-relative) path of the file, used to pick the empty representation that
     /// could apply to its component.
     path: PathBuf,
 
     /// The maximum number of bytes that may be buffered before the file is necessarily
-    /// non-empty ([`Empty::max_len`]).
+    /// non-empty or non-bundleable and must be streamed.
     cap: usize,
+
+    /// Whether the file may be [bundled][1] if it stays within `cap` and is non-empty.
+    ///
+    /// [1]: crate::bundle
+    bundle: bool,
 
     /// The current state of the writer.
     state: State,
@@ -79,12 +105,22 @@ enum State {
 impl Writer {
     /// Creates a writer for the file at `path`.
     ///
-    /// `open` lazily opens the downstream sink and is only ever called for
-    /// non-empty files; `on_done` records the outcome once the file is finalized.
-    pub fn new(path: PathBuf, open: OpenSink, on_done: OnDone) -> Self {
+    /// `cap` is the most bytes to buffer before the file must be streamed standalone,
+    /// `bundle` is whether the file may be bundled (when within `cap` and non-empty),
+    /// `open` lazily opens the downstream sink and is only ever called for streamed or
+    /// standalone files, and `on_done` records the [`Outcome`] once the file is
+    /// finalized.
+    ///
+    /// `cap` is raised to at least [`Empty::max_len`] so that a [logically empty][1]
+    /// file is always fully buffered and can be detected; a smaller cap would stream it
+    /// out before the check could run.
+    ///
+    /// [1]: crate::empty
+    pub fn new(path: PathBuf, cap: usize, bundle: bool, open: OpenSink, on_done: OnDone) -> Self {
         Self {
             path,
-            cap: Empty::max_len(),
+            cap: cmp::max(cap, Empty::max_len()),
+            bundle,
             state: State::Buffering(Vec::new()),
             open: Some(open),
             on_done: Some(on_done),
@@ -146,13 +182,16 @@ impl Write for Writer {
 
 impl TerminatingWrite for Writer {
     fn terminate_ref(&mut self, _: AntiCallToken) -> io::Result<()> {
-        let empty = match mem::replace(&mut self.state, State::Done) {
-            State::Buffering(buffer) => match Empty::detect(&self.path, &buffer) {
-                // Logically empty: skip the downstream sink entirely.
-                Some(empty) => Some(empty),
-
-                // Non-empty but small: flush the buffer downstream and finalize it.
-                None => {
+        let outcome = match mem::replace(&mut self.state, State::Done) {
+            State::Buffering(buffer) => {
+                if let Some(empty) = Empty::detect(&self.path, &buffer) {
+                    // Logically empty: skip the downstream sink entirely.
+                    Outcome::Empty(empty)
+                } else if self.bundle {
+                    // Bundle-eligible and within `cap`: hand the bytes back to be bundled.
+                    Outcome::Bundled(buffer)
+                } else {
+                    // Standalone: flush the buffer downstream and finalize it.
                     let open = self
                         .open
                         .take()
@@ -162,13 +201,13 @@ impl TerminatingWrite for Writer {
                     sink.write_all(&buffer)?;
                     sink.terminate()?;
 
-                    None
+                    Outcome::Standalone
                 }
-            },
+            }
 
             State::Streaming(sink) => {
                 sink.terminate()?;
-                None
+                Outcome::Standalone
             }
 
             State::Done => return Err(io::Error::other("the file was already finalized")),
@@ -179,7 +218,7 @@ impl TerminatingWrite for Writer {
             .take()
             .expect("a file can only be finalized once");
 
-        on_done(empty)
+        on_done(outcome)
     }
 }
 

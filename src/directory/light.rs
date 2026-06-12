@@ -1,4 +1,4 @@
-use std::{io, path::Path, sync::Arc};
+use std::{io, io::Write, path::Path, sync::Arc};
 
 use block_on_place::HandleExt;
 use derive_more::Debug;
@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use tantivy::{
     Directory,
     directory::{
-        DirectoryLock, FileHandle, Lock, WatchCallback, WatchHandle, WritePtr,
+        DirectoryLock, FileHandle, Lock, TerminatingWrite, WatchCallback, WatchHandle, WritePtr,
         error::{DeleteError, LockError, OpenReadError, OpenWriteError},
     },
 };
@@ -15,13 +15,14 @@ use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use crate::{
+    bundle::{self, Bundler},
     context::Context,
     directory::is_metadata,
     empty::Empty,
-    file::File,
-    metadata::MetadataStore,
+    file::{File, Slice},
+    metadata::{FileRecord, MetadataStore},
     utils::{PathExt, WrapIoErrorExt},
-    writer::{OnDone, OpenSink, Sink, Writer},
+    writer::{OnDone, OpenSink, Outcome, Sink, Writer},
 };
 
 /// A [`Directory`] implementation that delegates to an inner [`Directory`] for
@@ -57,6 +58,12 @@ pub struct LightDirectory<D> {
     /// Stores the metadata files for the directory.
     metadata: MetadataStore,
 
+    /// Buffers bundle-eligible files until they are written as one object per segment to
+    /// the inner directory at sync time.
+    ///
+    /// Empty if bundling is not enabled.
+    bundle: Bundler,
+
     /// The wrapped directory, handling every non-metadata operation.
     inner: D,
 }
@@ -81,6 +88,7 @@ impl<D> LightDirectory<D> {
         Ok(Self {
             rt: Handle::current(),
             metadata,
+            bundle: Bundler::default(),
             inner,
         })
     }
@@ -120,32 +128,83 @@ impl<D> LightDirectory<D> {
         self.metadata.context.write_concurrency = Some(concurrency);
         self
     }
+
+    /// Enables [bundling][1]: a segment's (non-empty, non-`.del`) component files are
+    /// concatenated into a single `<segment_uuid>.bundle` file in the inner directory
+    /// instead of one file per component.
+    ///
+    /// Disabled by default.
+    ///
+    /// A component file larger than [`with_bundle_max_file_bytes`][2] is left as its
+    /// own file so a large (merge) segment is never held in memory.
+    ///
+    /// [1]: crate::bundle
+    /// [2]: Self::with_bundle_max_file_bytes
+    pub fn with_bundling(mut self) -> Self {
+        self.metadata.context.bundle = true;
+        self
+    }
+
+    /// Sets the per-file size cap for [bundling][1]: files larger than this are written
+    /// as their own file instead of being bundled.
+    ///
+    /// Default is 16 MiB.
+    ///
+    /// [1]: crate::bundle
+    pub fn with_bundle_max_file_bytes(mut self, bytes: usize) -> Self {
+        self.metadata.context.bundle_max_file_bytes = bytes;
+        self
+    }
 }
 
 impl<D: Directory + Clone> Directory for LightDirectory<D> {
     fn get_file_handle(&self, filepath: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        // Non-empty files live in the inner directory; logically empty files were never
-        // written there, so a miss falls back to reconstructing them from memory.
+        // Standalone files live in the inner directory; empty and bundled files were
+        // never written there as themselves, so a miss falls back to the metadata store.
         match self.inner.get_file_handle(filepath) {
             Err(OpenReadError::FileDoesNotExist(_)) => (),
             result => return result,
         }
 
         let path = filepath.try_to_str::<OpenReadError>()?;
-        let is_empty = self
+
+        // A bundle-eligible file written but not yet synced lives only in the in-memory
+        // bundler; serve it from there.
+        if let Some(bytes) = self.rt.block_on_place(self.bundle.get(filepath)) {
+            return Ok(File::memory_owned(path, bytes));
+        }
+
+        let record = self
             .rt
             .block_on_place(self.metadata.file_lookup(path))
             .map_err(OpenReadError::wrapper(filepath))?;
 
-        match is_empty {
+        match record {
             // Reconstruct the logically empty file's bytes from memory.
-            Some(true) => {
+            Some(record) if record.is_empty => {
                 let empty = Empty::for_path(filepath)
                     .ok_or_else(|| OpenReadError::FileDoesNotExist(filepath.into()))?;
                 Ok(File::memory(path, empty.bytes()))
             }
-            // `Some(false)` cannot happen (only empty files are tracked here), and `None`
-            // means the file genuinely does not exist.
+
+            // Bundled: a byte range of the inner directory's bundle file.
+            Some(FileRecord {
+                byte_offset,
+                byte_length: Some(byte_length),
+                ..
+            }) => {
+                let object = bundle::object(filepath)
+                    .ok_or_else(|| OpenReadError::FileDoesNotExist(filepath.into()))?;
+                let handle = self.inner.get_file_handle(&object)?;
+                Ok(Slice::new(
+                    handle,
+                    byte_offset as usize,
+                    byte_length as usize,
+                ))
+            }
+
+            // Standalone files are never tracked here (they are in the inner directory), and
+            // `None` means the file genuinely does not exist.
             _ => Err(OpenReadError::FileDoesNotExist(filepath.into())),
         }
     }
@@ -195,8 +254,8 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
     }
 
     fn open_write(&self, filepath: &Path) -> Result<WritePtr, OpenWriteError> {
-        // The inner writer is opened lazily: a logically empty file is never written to
-        // the inner directory and is recorded in the metadata store instead.
+        // The inner writer is opened lazily: empty and bundled files are never written to
+        // the inner directory as themselves.
         let inner = self.inner.clone();
         let target = filepath.to_path_buf();
         let open: OpenSink = Box::new(move || {
@@ -204,22 +263,40 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
             Ok(Box::new(writer) as Sink)
         });
 
+        // When bundling, a small bundle-eligible file is buffered (not written to the
+        // inner directory) and bundled at sync; everything else behaves as without it.
+        let eligible = self.metadata.context.bundle && bundle::is_bundleable(filepath);
+        let cap = if eligible {
+            self.metadata.context.bundle_max_file_bytes
+        } else {
+            Empty::max_len()
+        };
+
         let metadata = self.metadata.clone();
+        let bundler = self.bundle.clone();
         let rt = self.rt.clone();
         let path = filepath.to_path_buf();
 
-        let on_done: OnDone = Box::new(move |empty| {
-            // Only empty files need recording; non-empty ones live in the inner directory.
-            if empty.is_some() {
-                let path = path.try_to_str::<io::Error>()?;
-                rt.block_on_place(metadata.create_file(path, true))
-                    .map_err(io::Error::other)?;
+        let on_done: OnDone = Box::new(move |outcome| {
+            match outcome {
+                // Empty files are recorded in the metadata store and reconstructed on read.
+                Outcome::Empty(_) => {
+                    let path = path.try_to_str::<io::Error>()?;
+                    rt.block_on_place(metadata.create_file(path, true, None))
+                        .map_err(io::Error::other)?;
+                }
+
+                // Standalone files already live in the inner directory; nothing to record.
+                Outcome::Standalone => {}
+
+                // Bundled bytes are buffered until the next sync.
+                Outcome::Bundled(bytes) => rt.block_on_place(bundler.buffer(path, bytes)),
             }
 
             Ok(())
         });
 
-        let writer = Writer::new(filepath.to_path_buf(), open, on_done);
+        let writer = Writer::new(filepath.to_path_buf(), cap, eligible, open, on_done);
         Ok(WritePtr::new(Box::new(writer)))
     }
 
@@ -235,8 +312,29 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
             .block_on_place(self.metadata.write_metadata(filepath, data))
     }
 
-    #[inline]
     fn sync_directory(&self) -> io::Result<()> {
+        // Bundled files: write one object per segment to the inner directory, then record
+        // each component's byte range in the metadata store.
+        for bundle in self.rt.block_on_place(self.bundle.drain()) {
+            let mut writer = self
+                .inner
+                .open_write(&bundle.path)
+                .map_err(io::Error::other)?;
+            writer.write_all(&bundle.bytes)?;
+            writer.terminate()?;
+
+            for entry in bundle.entries {
+                let path = entry.path.try_to_str::<io::Error>()?;
+                self.rt
+                    .block_on_place(self.metadata.create_file(
+                        path,
+                        false,
+                        Some((entry.offset, entry.length)),
+                    ))
+                    .map_err(io::Error::wrapper(&entry.path))?;
+            }
+        }
+
         self.inner.sync_directory()
     }
 

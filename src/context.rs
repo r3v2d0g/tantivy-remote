@@ -8,6 +8,13 @@ use uuid::Uuid;
 /// PostgreSQL.
 pub(crate) const DEFAULT_THRESHOLD: usize = 512 * 1024; // 512 KB
 
+/// Default per-file size cap for [bundling][1]: a component file larger than this
+/// is written as its own object instead of being buffered and bundled, keeping the
+/// in-memory buffering bounded even when a (merge) segment is large.
+///
+/// [1]: crate::bundle
+pub(crate) const DEFAULT_BUNDLE_MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Configuration shared across a [`FullDirectory`][1], its [`MetadataStore`][2] and
 /// the [`File`][3] handles it hands out.
 ///
@@ -36,6 +43,17 @@ pub(crate) struct Context {
     /// Defines the number of concurrent requests to make when writing a file to the
     /// storage backend.
     pub write_concurrency: Option<usize>,
+
+    /// Whether to [bundle][1] a segment's component files into a single object.
+    ///
+    /// [1]: crate::bundle
+    pub bundle: bool,
+
+    /// The per-file size cap for [bundling][1]: files larger than this are written
+    /// standalone instead of being bundled.
+    ///
+    /// [1]: crate::bundle
+    pub bundle_max_file_bytes: usize,
 }
 
 impl Context {
@@ -48,6 +66,8 @@ impl Context {
             write_chunks: None,
             read_concurrency: None,
             write_concurrency: None,
+            bundle: false,
+            bundle_max_file_bytes: DEFAULT_BUNDLE_MAX_FILE_BYTES,
         }
     }
 

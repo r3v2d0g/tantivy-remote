@@ -33,7 +33,23 @@ bundled component is served as a sub-range of its bundle object.
 and a component larger than `with_bundle_max_file_bytes` (default 16 MiB) stays
 a standalone object so a large merge segment is never held in memory. Bundling
 composes with the logically-empty optimization above: empty components are
-skipped, not bundled..
+skipped, not bundled.
+
+## File-lookup prefetch
+
+Empty and bundled component opens resolve through a PostgreSQL `file_lookup` when
+the path is absent from the object store/inner directory. Successful results
+are cached in-process. For a cold open or reload of a large bundled index, call
+`prefetch_files()` once on the directory before footer warm/`SegmentReader::open`
+so those opens do not pay one `SELECT` per path:
+
+```rust
+dir.prefetch_files().await?;
+```
+
+Missing paths are not cached (a concurrent writer can still create them). After
+another process commits, call `prefetch_files` again on that directory instance.
+Memory is `O(number of file rows)` for the index.
 
 ## Roadmap
 

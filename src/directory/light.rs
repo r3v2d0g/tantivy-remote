@@ -42,12 +42,23 @@ use crate::{
 /// metadata files: the readers using this directory should be created using
 /// [`ReloadPolicy::Manual`][6] and reloaded manually.
 ///
+/// ## File-lookup cache
+///
+/// Empty and [bundled][7] component opens fall back to a PostgreSQL `file_lookup` when
+/// the path is absent from the inner directory. Successful lookups are cached
+/// in-process. Call [`prefetch_files`][8] once before a cold open/reload (before
+/// footer warm / `SegmentReader::open`) so those opens do not pay one SELECT per
+/// path. Missing paths are not cached; after another process commits, call
+/// [`prefetch_files`][8] again on this directory instance.
+///
 /// [1]: crate::FullDirectory
 /// [2]: tantivy::directory::MmapDirectory
 /// [3]: Self::atomic_read
 /// [4]: Self::atomic_write
 /// [5]: Self::exists
 /// [6]: tantivy::ReloadPolicy::Manual
+/// [7]: crate::bundle
+/// [8]: Self::prefetch_files
 #[derive(Clone, Debug)]
 #[debug("LightDirectory {{ index: {}, inner: {inner:?} }}", metadata.context.index)]
 pub struct LightDirectory<D> {
@@ -154,6 +165,41 @@ impl<D> LightDirectory<D> {
     pub fn with_bundle_max_file_bytes(mut self, bytes: usize) -> Self {
         self.metadata.context.bundle_max_file_bytes = bytes;
         self
+    }
+
+    /// Loads all non-deleted file records for this index into the local lookup cache in
+    /// one PostgreSQL query.
+    ///
+    /// Returns the number of rows loaded. Safe to call multiple times: each call
+    /// **replaces** the cache with a fresh snapshot.
+    ///
+    /// Call this once at the start of a reader open/reload (before file-length preload
+    /// and footer warm) so [`get_file_handle`][1]/[`exists`][2] for empty and bundled
+    /// components do not issue per-path `SELECT`s. Standalone files that live only on
+    /// the inner directory are unaffected.
+    ///
+    /// Memory: `O(number of file rows)` for this index. After another process commits
+    /// new or deleted files, call this again before relying on the cache for those
+    /// paths.
+    ///
+    /// See also [`file_lookup_query_count`][3].
+    ///
+    /// [1]: Directory::get_file_handle
+    /// [2]: Directory::exists
+    /// [3]: Self::file_lookup_query_count
+    pub async fn prefetch_files(&self) -> sqlx::Result<usize> {
+        self.metadata.prefetch_files().await
+    }
+
+    /// Returns how many PostgreSQL queries `file_lookup` has issued on this directory's
+    /// metadata store (cache hits do not count).
+    ///
+    /// Useful for metrics and for verifying that [`prefetch_files`][1] eliminated
+    /// per-path lookups.
+    ///
+    /// [1]: Self::prefetch_files
+    pub fn file_lookup_query_count(&self) -> u64 {
+        self.metadata.file_lookup_query_count()
     }
 }
 

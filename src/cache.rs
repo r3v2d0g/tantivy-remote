@@ -8,7 +8,7 @@ use opendal::Metadata;
 use scc::hash_map::Entry;
 use tantivy::directory::error::{OpenReadError, OpenWriteError};
 
-use crate::{File, empty::Empty, utils::FastConcurrentMap};
+use crate::{File, empty::Empty, metadata::FileRecord, utils::FastConcurrentMap};
 
 // TODO(MLB): clean up the cache when a file is closed/after some time?
 
@@ -25,6 +25,50 @@ pub(crate) struct Cache {
 
     /// Caches the metadata which have been fetched.
     metadata: Arc<MetadataCache>,
+}
+
+/// In-process cache of successful [`FileRecord`][1] lookups for one index.
+///
+/// Only positive hits are stored: a missing path is never cached, so a concurrent
+/// writer creating a file cannot permanently poison a reader. Memory is
+/// `O(number of cached file rows)` for the index (small: path + a few integers per
+/// component).
+///
+/// Shared across clones via [`Arc`]. All accessors are synchronous so callers can
+/// consult the cache from `block_on_place` paths without holding a lock across
+/// `.await`.
+///
+/// [1]: crate::metadata::FileRecord
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileLookupCache {
+    records: Arc<FastConcurrentMap<String, FileRecord>>,
+}
+
+impl FileLookupCache {
+    /// Returns the cached [`FileRecord`][1] for `path`, if any.
+    ///
+    /// [1]: crate::metadata::FileRecord
+    pub fn get(&self, path: &str) -> Option<FileRecord> {
+        self.records.read_sync(path, |_, record| record.clone())
+    }
+
+    /// Inserts or replaces the cached record for `path`.
+    pub fn insert(&self, path: String, record: FileRecord) {
+        let _ = self.records.upsert_sync(path, record);
+    }
+
+    /// Removes the cached record for `path`, if any.
+    pub fn remove(&self, path: &str) {
+        let _ = self.records.remove_sync(path);
+    }
+
+    /// Replaces the entire cache with `entries` (used by prefetch).
+    pub fn replace_all(&self, entries: impl IntoIterator<Item = (String, FileRecord)>) {
+        self.records.clear_sync();
+        for (path, record) in entries {
+            let _ = self.records.insert_sync(path, record);
+        }
+    }
 }
 
 /// Caches the paths of the files which have been created, until the directory

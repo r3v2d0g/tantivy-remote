@@ -38,7 +38,16 @@ use crate::{
 /// directory to make sure that there can only be one index writer using it at any
 /// given time.
 ///
+/// ## File-lookup cache
+///
+/// Successful PostgreSQL `file_lookup` results are cached in-process for the
+/// lifetime of this directory (shared across clones). Call [`prefetch_files`][2]
+/// once before a cold open/reload to avoid one SELECT per segment component.
+/// Missing paths are not cached; after another process commits, prefetch again on
+/// this directory instance.
+///
 /// [1]: tantivy::ReloadPolicy::Manual
+/// [2]: Self::prefetch_files
 #[derive(Clone, Debug)]
 #[debug("FullDirectory {{ index: {} }}", context.index)]
 pub struct FullDirectory {
@@ -160,6 +169,36 @@ impl FullDirectory {
         self.context.bundle_max_file_bytes = bytes;
         self.metadata.context.bundle_max_file_bytes = bytes;
         self
+    }
+
+    /// Loads all non-deleted file records for this index into the local lookup cache in
+    /// one PostgreSQL query.
+    ///
+    /// Returns the number of rows loaded. Safe to call multiple times: each call
+    /// **replaces** the cache with a fresh snapshot.
+    ///
+    /// Call this once at the start of a reader open/reload so subsequent
+    /// [`get_file_handle`][1] calls do not issue per-path `SELECT`s for known
+    /// empty/bundled/standalone metadata rows.
+    ///
+    /// Memory: `O(number of file rows)` for this index. After another process commits
+    /// new or deleted files, call this again before relying on the cache for those
+    /// paths.
+    ///
+    /// [1]: Directory::get_file_handle
+    pub async fn prefetch_files(&self) -> sqlx::Result<usize> {
+        self.metadata.prefetch_files().await
+    }
+
+    /// Returns how many PostgreSQL queries `file_lookup` has issued on this directory's
+    /// metadata store (cache hits do not count).
+    ///
+    /// Useful for metrics and for verifying that [`prefetch_files`][1] eliminated
+    /// per-path lookups.
+    ///
+    /// [1]: Self::prefetch_files
+    pub fn file_lookup_query_count(&self) -> u64 {
+        self.metadata.file_lookup_query_count()
     }
 
     /// Opens the file at `filepath` for reading, returning a [`File`] handle for it.

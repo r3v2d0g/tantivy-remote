@@ -1,4 +1,11 @@
-use std::{io, path::Path};
+use std::{
+    io,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use derive_more::Debug;
 use eyre::{Context as _, Result};
@@ -6,11 +13,24 @@ use opendal::Operator;
 use sqlx::PgPool;
 
 use crate::{
+    cache::FileLookupCache,
     context::Context,
     utils::{PathExt, WrapIoErrorExt},
 };
 
 /// Takes care of storing and retrieving metadata about indexes.
+///
+/// Successful [`file_lookup`][1] results are cached in-process (see
+/// [`FileLookupCache`][3]). Call [`prefetch_files`][2] once before opening many
+/// segment components to collapse `O(N)` PostgreSQL round-trips into one bulk query.
+/// Missing paths are **not** cached: a concurrent writer can still create them, and
+/// a subsequent [`file_lookup`][1] will hit PostgreSQL. After another process commits
+/// new files, call [`prefetch_files`][2] again (or rely on per-path cache fills) on
+/// this store instance.
+///
+/// [1]: Self::file_lookup
+/// [2]: Self::prefetch_files
+/// [3]: crate::cache::FileLookupCache
 #[derive(Clone, Debug)]
 pub struct MetadataStore {
     /// Pool of connections to interact with PSQL.
@@ -21,18 +41,29 @@ pub struct MetadataStore {
 
     /// The configuration shared with the directory that owns this store.
     pub(crate) context: Context,
+
+    /// Caches successful [`FileRecord`][1] lookups for this index.
+    ///
+    /// [1]: FileRecord
+    files: FileLookupCache,
+
+    /// Number of PostgreSQL round-trips performed by [`file_lookup`][1]
+    /// (cache hits do not increment this).
+    ///
+    /// [1]: Self::file_lookup
+    lookup_queries: Arc<AtomicU64>,
 }
 
 /// What the metadata store knows about a non-metadata file: whether it is
 /// [logically empty][1] and, if it was [bundled][2], where its bytes live inside
 /// the bundle object.
 ///
-/// The file is bundled iff [`byte_length`][Self::byte_length] is `Some`.
+/// The file is bundled iff [`byte_length`][3] is `Some`.
 ///
 /// [1]: crate::empty
 /// [2]: crate::bundle
-/// [3]: crate::bundle::object
-#[derive(Clone, Debug)]
+/// [3]: Self::byte_length
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileRecord {
     /// Whether the file is logically empty (reconstructed from memory on read).
     pub is_empty: bool,
@@ -71,7 +102,21 @@ impl MetadataStore {
             pool,
             operator,
             context: context.clone(),
+            files: FileLookupCache::default(),
+            lookup_queries: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Returns how many PostgreSQL queries [`file_lookup`][1] has issued (cache hits do
+    /// not count).
+    ///
+    /// Useful for metrics and for verifying that [`prefetch_files`][2] eliminated
+    /// per-path lookups.
+    ///
+    /// [1]: Self::file_lookup
+    /// [2]: Self::prefetch_files
+    pub fn file_lookup_query_count(&self) -> u64 {
+        self.lookup_queries.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if there is a non-metadata file with the given path that exists
@@ -82,7 +127,17 @@ impl MetadataStore {
 
     /// Looks up a non-metadata file by path, returning its [`FileRecord`] if it exists
     /// (and has not been deleted).
+    ///
+    /// Consults the in-process cache first. On a miss, issues a single-row PostgreSQL
+    /// `SELECT` and, on a hit, inserts the record into the cache. Misses (`None`) are
+    /// not cached.
     pub async fn file_lookup(&self, path: &str) -> sqlx::Result<Option<FileRecord>> {
+        if let Some(record) = self.files.get(path) {
+            return Ok(Some(record));
+        }
+
+        self.lookup_queries.fetch_add(1, Ordering::Relaxed);
+
         let query = sqlx::query_as(
             r#"
             SELECT is_empty, byte_offset, byte_length
@@ -102,11 +157,60 @@ impl MetadataStore {
             return Ok(None);
         };
 
-        Ok(Some(FileRecord {
+        let record = FileRecord {
             is_empty,
             byte_offset,
             byte_length,
-        }))
+        };
+        self.files.insert(path.to_owned(), record.clone());
+
+        Ok(Some(record))
+    }
+
+    /// Loads every non-deleted file record for this index in one query.
+    pub async fn list_files(&self) -> sqlx::Result<Vec<(String, FileRecord)>> {
+        let query = sqlx::query_as(
+            r#"
+            SELECT path, is_empty, byte_offset, byte_length
+            FROM tantivy.files
+            WHERE index = $1
+              AND deleted_at IS NULL
+            "#,
+        );
+
+        let rows: Vec<(String, bool, i64, Option<i64>)> =
+            query.bind(self.context.index).fetch_all(&self.pool).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(path, is_empty, byte_offset, byte_length)| {
+                let record = FileRecord {
+                    is_empty,
+                    byte_offset,
+                    byte_length,
+                };
+
+                (path, record)
+            })
+            .collect())
+    }
+
+    /// Loads all non-deleted file records for this index into the local cache in one
+    /// query.
+    ///
+    /// Returns the number of rows loaded. Safe to call multiple times: each call
+    /// **replaces** the cache contents with a fresh snapshot from PostgreSQL.
+    ///
+    /// Memory bound: `O(number of file rows)` for this index (~path + a few integers
+    /// per segment component). At tens of thousands of segments this stays small.
+    ///
+    /// After another process commits new or deleted files, call this again before
+    /// relying on the cache for a cold open/reload of those paths.
+    pub async fn prefetch_files(&self) -> sqlx::Result<usize> {
+        let files = self.list_files().await?;
+        let count = files.len();
+        self.files.replace_all(files);
+        Ok(count)
     }
 
     /// Creates a non-metadata file in the metadata store.
@@ -117,6 +221,8 @@ impl MetadataStore {
     /// `bundle` records where the file's bytes live: `None` means the file is its own
     /// object at its path, `Some((offset, length))` means its bytes live inside its
     /// segment's [bundle][2] object at `[offset, offset + length)`.
+    ///
+    /// On success the local lookup cache is updated for `path`.
     ///
     /// [1]: crate::empty
     /// [2]: crate::bundle
@@ -148,6 +254,14 @@ impl MetadataStore {
             .execute(&self.pool)
             .await?;
 
+        let record = FileRecord {
+            is_empty,
+            byte_offset,
+            byte_length,
+        };
+
+        self.files.insert(path.to_owned(), record);
+
         Ok(())
     }
 
@@ -155,6 +269,8 @@ impl MetadataStore {
     ///
     /// Returns `true` if the file was deleted, `false` if it did not exist or was
     /// already deleted.
+    ///
+    /// On a successful delete the path is removed from the local lookup cache.
     pub async fn delete_file(&self, path: &str) -> sqlx::Result<bool> {
         let update = sqlx::query_scalar(
             r#"
@@ -173,7 +289,12 @@ impl MetadataStore {
             .fetch_optional(&self.pool)
             .await?;
 
-        Ok(row.is_some())
+        let deleted = row.is_some();
+        if deleted {
+            self.files.remove(path);
+        }
+
+        Ok(deleted)
     }
 
     /// Returns `true` if there is a metadata file with the given path stored in the

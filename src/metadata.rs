@@ -224,6 +224,10 @@ impl MetadataStore {
     ///
     /// On success the local lookup cache is updated for `path`.
     ///
+    /// Returns an error if `path` already exists as a live or soft-deleted row
+    /// (`INSERT … ON CONFLICT DO NOTHING` inserts nothing). The lookup cache is not
+    /// updated in that case, so a failed create cannot report the file as present.
+    ///
     /// [1]: crate::empty
     /// [2]: crate::bundle
     pub async fn create_file(
@@ -237,30 +241,39 @@ impl MetadataStore {
             None => (0, None),
         };
 
-        let create = sqlx::query(
+        let create = sqlx::query_scalar(
             r#"
             INSERT INTO tantivy.files (index, path, is_empty, byte_offset, byte_length)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT DO NOTHING
+            RETURNING 1
             "#,
         );
 
-        create
+        let inserted: Option<i32> = create
             .bind(self.context.index)
             .bind(path)
             .bind(is_empty)
             .bind(byte_offset)
             .bind(byte_length)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
 
-        let record = FileRecord {
-            is_empty,
-            byte_offset,
-            byte_length,
-        };
+        if inserted.is_none() {
+            return Err(sqlx::Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("file already exists: {path}"),
+            )));
+        }
 
-        self.files.insert(path.to_owned(), record);
+        self.files.insert(
+            path.to_owned(),
+            FileRecord {
+                is_empty,
+                byte_offset,
+                byte_length,
+            },
+        );
 
         Ok(())
     }

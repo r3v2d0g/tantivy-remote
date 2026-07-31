@@ -306,3 +306,57 @@ async fn concurrent_miss_then_create_is_visible() -> Result<()> {
 
     Ok(())
 }
+
+/// A conflicting `create_file` (live row or soft-deleted tombstone) errors and does not
+/// poison the lookup cache with the requested record.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_file_conflict_does_not_poison_cache() -> Result<()> {
+    let index = Uuid::new_v4();
+    let pool = pool().await?;
+    let operator = operator()?;
+    let context = Context::new(index);
+    let store = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
+
+    store.create_file("seg.term", true, None).await?;
+
+    // Live conflict: second create must fail and leave the original cached record.
+    let live = store.create_file("seg.term", false, Some((0, 10))).await;
+    assert!(
+        matches!(&live, Err(sqlx::Error::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists, got {live:?}",
+    );
+
+    let original = store.file_lookup("seg.term").await?;
+    assert_eq!(
+        original,
+        Some(crate::metadata::FileRecord {
+            is_empty: true,
+            byte_offset: 0,
+            byte_length: None,
+        }),
+        "failed recreate must not overwrite the cached live record",
+    );
+
+    assert_eq!(store.file_lookup_query_count(), 0);
+    assert!(store.delete_file("seg.term").await?);
+
+    // Tombstone conflict: soft-deleted PK still blocks INSERT; must not cache a live hit.
+    let tombstone = store.create_file("seg.term", false, Some((4, 8))).await;
+    assert!(
+        matches!(&tombstone, Err(sqlx::Error::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists on tombstone, got {tombstone:?}",
+    );
+
+    assert!(
+        store.file_lookup("seg.term").await?.is_none(),
+        "failed create after soft-delete must not report the file as present",
+    );
+
+    let fresh = MetadataStore::open(&context, pool, operator).await?;
+    assert!(
+        fresh.file_lookup("seg.term").await?.is_none(),
+        "fresh store must also see no live row",
+    );
+
+    Ok(())
+}

@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use derive_more::Deref;
@@ -36,12 +36,17 @@ pub(crate) struct Cache {
 ///
 /// Shared across clones via [`Arc`]. All accessors are synchronous so callers can
 /// consult the cache from `block_on_place` paths without holding a lock across
-/// `.await`.
+/// `.await`. Prefetch publishes a fully built map via [`replace_all`][2], so
+/// concurrent lookups never observe a half-empty cache.
 ///
 /// [1]: crate::metadata::FileRecord
+/// [2]: Self::replace_all
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FileLookupCache {
-    records: Arc<FastConcurrentMap<String, FileRecord>>,
+    /// The live record map. Readers take a short `RwLock` read guard; prefetch swaps
+    /// the inner [`Arc`] under a write guard after building the replacement off to
+    /// the side, so the clear-then-fill window is never visible.
+    records: Arc<RwLock<Arc<FastConcurrentMap<String, FileRecord>>>>,
 }
 
 impl FileLookupCache {
@@ -49,25 +54,55 @@ impl FileLookupCache {
     ///
     /// [1]: crate::metadata::FileRecord
     pub fn get(&self, path: &str) -> Option<FileRecord> {
-        self.records.read_sync(path, |_, record| record.clone())
+        let records = self
+            .records
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+
+        records.read_sync(path, |_, record| record.clone())
     }
 
     /// Inserts or replaces the cached record for `path`.
     pub fn insert(&self, path: String, record: FileRecord) {
-        let _ = self.records.upsert_sync(path, record);
+        let records = self
+            .records
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let _ = records.upsert_sync(path, record);
     }
 
     /// Removes the cached record for `path`, if any.
     pub fn remove(&self, path: &str) {
-        let _ = self.records.remove_sync(path);
+        let records = self
+            .records
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let _ = records.remove_sync(path);
     }
 
-    /// Replaces the entire cache with `entries` (used by prefetch).
+    /// Atomically replaces the entire cache with `entries` (used by prefetch).
+    ///
+    /// Builds the replacement map first, then swaps it in under a write lock so
+    /// concurrent [`get`][1]/[`insert`][2]/[`remove`][3] never observe an empty or
+    /// partially rebuilt cache.
+    ///
+    /// [1]: Self::get
+    /// [2]: Self::insert
+    /// [3]: Self::remove
     pub fn replace_all(&self, entries: impl IntoIterator<Item = (String, FileRecord)>) {
-        self.records.clear_sync();
+        let next = FastConcurrentMap::default();
         for (path, record) in entries {
-            let _ = self.records.insert_sync(path, record);
+            let _ = next.insert_sync(path, record);
         }
+
+        let mut records = self
+            .records
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+
+        *records = Arc::new(next);
     }
 }
 

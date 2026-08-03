@@ -77,6 +77,38 @@ pub struct FileRecord {
     pub byte_length: Option<i64>,
 }
 
+/// A non-metadata file to insert into the metadata store.
+#[derive(Clone, Debug)]
+pub(crate) struct NewFile {
+    /// Index-relative path of the file.
+    pub path: String,
+
+    /// Whether the file is [logically empty][1].
+    ///
+    /// [1]: crate::empty
+    pub is_empty: bool,
+
+    /// Where the file's bytes live.
+    ///
+    /// `None` means the file is its own object at its path, `Some((offset, length))`
+    /// means its bytes live inside its segment's [bundle][1] object at
+    /// `[offset, offset + length)`.
+    ///
+    /// [1]: crate::bundle
+    pub bundle: Option<(u64, u64)>,
+}
+
+impl NewFile {
+    /// Creates a new file description for `path`.
+    pub fn new(path: impl Into<String>, is_empty: bool, bundle: Option<(u64, u64)>) -> Self {
+        Self {
+            path: path.into(),
+            is_empty,
+            bundle,
+        }
+    }
+}
+
 impl MetadataStore {
     /// Creates a new metadata store for the index described by `context`.
     ///
@@ -236,44 +268,69 @@ impl MetadataStore {
         is_empty: bool,
         bundle: Option<(u64, u64)>,
     ) -> sqlx::Result<()> {
-        let (byte_offset, byte_length) = match bundle {
-            Some((offset, length)) => (offset as i64, Some(length as i64)),
-            None => (0, None),
-        };
+        self.create_files(vec![NewFile::new(path, is_empty, bundle)])
+            .await
+    }
 
-        let create = sqlx::query_scalar(
-            r#"
-            INSERT INTO tantivy.files (index, path, is_empty, byte_offset, byte_length)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT DO NOTHING
-            RETURNING 1
-            "#,
-        );
-
-        let inserted: Option<i32> = create
-            .bind(self.context.index)
-            .bind(path)
-            .bind(is_empty)
-            .bind(byte_offset)
-            .bind(byte_length)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        if inserted.is_none() {
-            return Err(sqlx::Error::Io(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("file already exists: {path}"),
-            )));
+    /// Creates all supplied non-metadata files in one PostgreSQL transaction.
+    ///
+    /// The local lookup cache is updated only after the transaction commits, so neither
+    /// PostgreSQL nor the cache can expose a partially created set.
+    pub(crate) async fn create_files(&self, files: Vec<NewFile>) -> sqlx::Result<()> {
+        if files.is_empty() {
+            return Ok(());
         }
 
-        self.files.insert(
-            path.to_owned(),
-            FileRecord {
-                is_empty,
-                byte_offset,
-                byte_length,
-            },
-        );
+        let mut transaction = self.pool.begin().await?;
+        let mut records = Vec::with_capacity(files.len());
+
+        for file in files {
+            let (byte_offset, byte_length) = match file.bundle {
+                Some((offset, length)) => (offset as i64, Some(length as i64)),
+                None => (0, None),
+            };
+
+            let create = sqlx::query_scalar(
+                r#"
+                INSERT INTO tantivy.files (index, path, is_empty, byte_offset, byte_length)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT DO NOTHING
+                RETURNING 1
+                "#,
+            );
+
+            let inserted: Option<i32> = create
+                .bind(self.context.index)
+                .bind(&file.path)
+                .bind(file.is_empty)
+                .bind(byte_offset)
+                .bind(byte_length)
+                .fetch_optional(&mut *transaction)
+                .await?;
+
+            if inserted.is_none() {
+                transaction.rollback().await?;
+
+                return Err(sqlx::Error::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("file already exists: {}", file.path),
+                )));
+            }
+
+            records.push((
+                file.path,
+                FileRecord {
+                    is_empty: file.is_empty,
+                    byte_offset,
+                    byte_length,
+                },
+            ));
+        }
+
+        transaction.commit().await?;
+        for (path, record) in records {
+            self.files.insert(path, record);
+        }
 
         Ok(())
     }

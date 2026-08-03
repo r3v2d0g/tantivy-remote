@@ -13,7 +13,12 @@ use tantivy::directory::{Directory, RamDirectory, TerminatingWrite};
 use tokio::task;
 use uuid::Uuid;
 
-use crate::{LightDirectory, context::Context, empty::Empty, metadata::MetadataStore};
+use crate::{
+    LightDirectory,
+    context::Context,
+    empty::Empty,
+    metadata::{MetadataStore, NewFile},
+};
 
 /// Connects to the test database.
 async fn pool() -> Result<PgPool> {
@@ -356,6 +361,44 @@ async fn create_file_conflict_does_not_poison_cache() -> Result<()> {
     assert!(
         fresh.file_lookup("seg.term").await?.is_none(),
         "fresh store must also see no live row",
+    );
+
+    Ok(())
+}
+
+/// A conflict anywhere in a bulk create rolls back every file in that sync and leaves
+/// the lookup cache unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_files_is_atomic() -> Result<()> {
+    let index = Uuid::new_v4();
+    let pool = pool().await?;
+    let operator = operator()?;
+    let context = Context::new(index);
+    let store = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
+
+    store.create_file("existing.idx", false, None).await?;
+
+    let result = store
+        .create_files(vec![
+            NewFile::new("new.idx", false, Some((0, 8))),
+            NewFile::new("existing.idx", true, None),
+        ])
+        .await;
+
+    assert!(
+        matches!(&result, Err(sqlx::Error::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists, got {result:?}",
+    );
+
+    assert!(
+        store.file_lookup("new.idx").await?.is_none(),
+        "rolled-back file must not be cached",
+    );
+
+    let fresh = MetadataStore::open(&context, pool, operator).await?;
+    assert!(
+        fresh.file_lookup("new.idx").await?.is_none(),
+        "rolled-back file must not exist in PostgreSQL",
     );
 
     Ok(())

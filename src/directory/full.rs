@@ -21,7 +21,7 @@ use crate::{
     directory::is_metadata,
     empty::Empty,
     file::File,
-    metadata::MetadataStore,
+    metadata::{MetadataStore, NewFile},
     operator::Operator,
     utils::{PathExt, WrapIoErrorExt},
     writer::{OnDone, OpenSink, OpendalSink, Outcome, Writer},
@@ -424,22 +424,23 @@ impl Directory for FullDirectory {
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        // Standalone and empty files: record each in the metadata store. The cache keys
-        // are prefixed with the index ID, which we strip before storing.
+        let mut files = Vec::new();
+
+        // Collect standalone and empty files. The cache keys are prefixed with the index
+        // ID, which we strip before storing.
         for (path, empty) in self.rt.block_on_place(self.cache.sync()) {
             let mut components = path.components();
             components.next();
 
             let filepath = components.as_path();
             let path = filepath.try_to_str::<io::Error>()?;
+            let file = NewFile::new(path, empty.is_some(), None);
 
-            self.rt
-                .block_on_place(self.metadata.create_file(path, empty.is_some(), None))
-                .map_err(io::Error::wrapper(filepath))?;
+            files.push(file);
         }
 
-        // Bundled files: write one object per segment, then record each component's byte
-        // range. The bundler is keyed by index-relative paths.
+        // Write bundled objects and collect each component's byte range. The bundler is
+        // keyed by index-relative paths.
         for bundle in self.rt.block_on_place(self.bundle.drain()) {
             let object = self.context.path(&bundle.path);
             let object = object.try_to_str::<io::Error>()?;
@@ -453,15 +454,16 @@ impl Directory for FullDirectory {
 
             for entry in bundle.entries {
                 let path = entry.path.try_to_str::<io::Error>()?;
-                self.rt
-                    .block_on_place(self.metadata.create_file(
-                        path,
-                        false,
-                        Some((entry.offset, entry.length)),
-                    ))
-                    .map_err(io::Error::wrapper(&entry.path))?;
+                let file = NewFile::new(path, false, Some((entry.offset, entry.length)));
+
+                files.push(file);
             }
         }
+
+        // Publish every file from this sync atomically in one PostgreSQL transaction.
+        self.rt
+            .block_on_place(self.metadata.create_files(files))
+            .map_err(io::Error::other)?;
 
         // TODO(MLB): remove from the cache
 

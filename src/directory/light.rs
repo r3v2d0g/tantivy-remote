@@ -20,7 +20,7 @@ use crate::{
     directory::is_metadata,
     empty::Empty,
     file::{File, Slice},
-    metadata::{FileRecord, MetadataStore},
+    metadata::{FileRecord, MetadataStore, NewFile},
     utils::{PathExt, WrapIoErrorExt},
     writer::{OnDone, OpenSink, Outcome, Sink, Writer},
 };
@@ -359,8 +359,9 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        // Bundled files: write one object per segment to the inner directory, then record
-        // each component's byte range in the metadata store.
+        let mut files = Vec::new();
+
+        // Write one bundle per segment and collect each component's byte range.
         for bundle in self.rt.block_on_place(self.bundle.drain()) {
             let mut writer = self
                 .inner
@@ -371,17 +372,19 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
 
             for entry in bundle.entries {
                 let path = entry.path.try_to_str::<io::Error>()?;
-                self.rt
-                    .block_on_place(self.metadata.create_file(
-                        path,
-                        false,
-                        Some((entry.offset, entry.length)),
-                    ))
-                    .map_err(io::Error::wrapper(&entry.path))?;
+                let file = NewFile::new(path, false, Some((entry.offset, entry.length)));
+
+                files.push(file);
             }
         }
 
-        self.inner.sync_directory()
+        self.inner.sync_directory()?;
+
+        // Publish every bundled component from this sync atomically in one PostgreSQL
+        // transaction, after the inner directory has made the bundle files durable.
+        self.rt
+            .block_on_place(self.metadata.create_files(files))
+            .map_err(io::Error::other)
     }
 
     #[inline]

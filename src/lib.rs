@@ -4,6 +4,7 @@ mod context;
 mod directory;
 mod empty;
 mod file;
+mod lock;
 mod metadata;
 mod operator;
 mod utils;

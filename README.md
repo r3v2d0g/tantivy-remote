@@ -51,6 +51,26 @@ Missing paths are not cached (a concurrent writer can still create them). After
 another process commits, call `prefetch_files` again on that directory instance.
 Memory is `O(number of file rows)` for the index.
 
+## PostgreSQL pool sizing and writer fencing
+
+Tantivy's directory locks are implemented with PostgreSQL session-level advisory
+locks. Each held lock checks out one connection for its full lifetime. A live
+`IndexWriter` therefore reserves one pool connection, while short-lived metadata
+locks may reserve another connection during reader reload or garbage collection.
+
+Size the pool for the maximum number of concurrently open writers and metadata
+locks, plus the connections needed for normal file and metadata queries. Lock
+connections execute `SELECT 1` every 30 seconds so PostgreSQL and network proxies do
+not close an otherwise idle session and release its advisory lock.
+
+Acquiring the writer lock also publishes a fencing token on
+`tantivy.directories.writer_token`. Mutating metadata operations
+(`create_files`, `delete_file`, `write_metadata`) check that token in the same
+PostgreSQL transaction as the mutation. If the lock session dies, the local fence
+is poisoned and the token is cleared best-effort, so this writer cannot publish
+further changes; if another writer takes over, the rotated token rejects the stale
+writer the same way.
+
 ## Roadmap
 
 We plan on implementing the following features:
@@ -66,10 +86,3 @@ adding those are more than welcome:
   could be done using PostgreSQL's `LISTEN` and `NOTIFY`, although if implemented
   like so, it should be made optional, so that users that don't need automatic
   reloading don't pay any cost for it.
-- Locking: similarly, our use-case for this crate guarantees that there cannot be
-  more than one index writer at the same time – we thus did not implement any
-  directory logic. This could be done using a PostgreSQL and a background `tokio`
-  task updating some `last_alive_at` value, or using Redis. Similarly to automatic
-  reloading, this should be made optional, so that users that can guarantee that
-  there won't be more than one index writer using the same directory at any point
-  in time don't have to pay any extra cost.

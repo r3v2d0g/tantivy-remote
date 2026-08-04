@@ -17,6 +17,7 @@ use crate::{
     LightDirectory,
     context::Context,
     empty::Empty,
+    lock::WriterFence,
     metadata::{MetadataStore, NewFile},
 };
 
@@ -65,11 +66,18 @@ async fn file_lookup_caches_hits() -> Result<()> {
     let operator = operator()?;
     let context = Context::new(index);
 
-    let writer = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
+    let writer = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await?;
+
     writer.create_file("seg.fast", true, None).await?;
 
     // Fresh store over the same index: empty cache, same rows.
-    let store = MetadataStore::open(&context, pool, operator).await?;
+    let store = MetadataStore::open(&context, pool, operator, WriterFence::default()).await?;
     assert_eq!(store.file_lookup_query_count(), 0);
 
     let first = store.file_lookup("seg.fast").await?;
@@ -95,8 +103,15 @@ async fn file_lookup_does_not_poison_on_miss() -> Result<()> {
     let operator = operator()?;
     let context = Context::new(index);
 
-    let reader = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
-    let writer = MetadataStore::open(&context, pool, operator).await?;
+    let reader = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await?;
+
+    let writer = MetadataStore::open(&context, pool, operator, WriterFence::default()).await?;
 
     assert!(reader.file_lookup("seg.idx").await?.is_none());
     assert_eq!(reader.file_lookup_query_count(), 1);
@@ -121,7 +136,7 @@ async fn delete_invalidates_lookup_cache() -> Result<()> {
     let pool = pool().await?;
     let operator = operator()?;
     let context = Context::new(index);
-    let store = MetadataStore::open(&context, pool, operator).await?;
+    let store = MetadataStore::open(&context, pool, operator, WriterFence::default()).await?;
 
     store.create_file("seg.pos", true, None).await?;
     assert!(store.file_lookup("seg.pos").await?.is_some());
@@ -291,7 +306,8 @@ async fn concurrent_miss_then_create_is_visible() -> Result<()> {
     let operator = operator()?;
     let context = Context::new(index);
 
-    let store = Arc::new(MetadataStore::open(&context, pool, operator).await?);
+    let store =
+        Arc::new(MetadataStore::open(&context, pool, operator, WriterFence::default()).await?);
     let store_a = Arc::clone(&store);
     let store_b = Arc::clone(&store);
 
@@ -320,7 +336,13 @@ async fn create_file_conflict_does_not_poison_cache() -> Result<()> {
     let pool = pool().await?;
     let operator = operator()?;
     let context = Context::new(index);
-    let store = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
+    let store = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await?;
 
     store.create_file("seg.term", true, None).await?;
 
@@ -357,7 +379,7 @@ async fn create_file_conflict_does_not_poison_cache() -> Result<()> {
         "failed create after soft-delete must not report the file as present",
     );
 
-    let fresh = MetadataStore::open(&context, pool, operator).await?;
+    let fresh = MetadataStore::open(&context, pool, operator, WriterFence::default()).await?;
     assert!(
         fresh.file_lookup("seg.term").await?.is_none(),
         "fresh store must also see no live row",
@@ -374,7 +396,13 @@ async fn create_files_is_atomic() -> Result<()> {
     let pool = pool().await?;
     let operator = operator()?;
     let context = Context::new(index);
-    let store = MetadataStore::open(&context, pool.clone(), operator.clone()).await?;
+    let store = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await?;
 
     store.create_file("existing.idx", false, None).await?;
 
@@ -395,7 +423,7 @@ async fn create_files_is_atomic() -> Result<()> {
         "rolled-back file must not be cached",
     );
 
-    let fresh = MetadataStore::open(&context, pool, operator).await?;
+    let fresh = MetadataStore::open(&context, pool, operator, WriterFence::default()).await?;
     assert!(
         fresh.file_lookup("new.idx").await?.is_none(),
         "rolled-back file must not exist in PostgreSQL",

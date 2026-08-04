@@ -4,7 +4,7 @@ use opendal::{Operator, services::Memory};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{context::Context, metadata::MetadataStore};
+use crate::{context::Context, lock::WriterFence, metadata::MetadataStore};
 
 /// Connects to the test database, panicking if it is unreachable.
 async fn pool() -> PgPool {
@@ -50,9 +50,14 @@ async fn small_metadata_stored_in_postgresql() {
 
     let mut context = Context::new(index);
     context.threshold = 1024;
-    let store = MetadataStore::open(&context, pool.clone(), operator.clone())
-        .await
-        .expect("failed to open metadata store");
+    let store = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await
+    .expect("failed to open metadata store");
 
     let filepath = Path::new("meta.json");
     let content = vec![42u8; 512];
@@ -90,9 +95,14 @@ async fn large_metadata_stored_in_object_store() {
 
     let mut context = Context::new(index);
     context.threshold = 1024;
-    let store = MetadataStore::open(&context, pool.clone(), operator.clone())
-        .await
-        .expect("failed to open metadata store");
+    let store = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await
+    .expect("failed to open metadata store");
 
     let filepath = Path::new("meta.json");
     let content = vec![7u8; 4096];
@@ -125,7 +135,7 @@ async fn missing_metadata_returns_none() {
 
     let mut context = Context::new(index);
     context.threshold = 1024;
-    let store = MetadataStore::open(&context, pool, operator)
+    let store = MetadataStore::open(&context, pool, operator, WriterFence::default())
         .await
         .expect("failed to open metadata store");
 
@@ -146,9 +156,14 @@ async fn rewrite_across_threshold() {
 
     let mut context = Context::new(index);
     context.threshold = 1024;
-    let store = MetadataStore::open(&context, pool.clone(), operator.clone())
-        .await
-        .expect("failed to open metadata store");
+    let store = MetadataStore::open(
+        &context,
+        pool.clone(),
+        operator.clone(),
+        WriterFence::default(),
+    )
+    .await
+    .expect("failed to open metadata store");
 
     let filepath = Path::new("meta.json");
 

@@ -21,6 +21,7 @@ use crate::{
     directory::is_metadata,
     empty::Empty,
     file::File,
+    lock::{AdvisoryLocks, WriterFence},
     metadata::{MetadataStore, NewFile},
     operator::Operator,
     utils::{PathExt, WrapIoErrorExt},
@@ -34,9 +35,13 @@ use crate::{
 /// readers using this directory should be created using [`ReloadPolicy::Manual`][1]
 /// and reloaded manually.
 ///
-/// This also does not implement any locking logic. It is up to the user of this
-/// directory to make sure that there can only be one index writer using it at any
-/// given time.
+/// Tantivy directory locks are implemented with PostgreSQL session-level advisory
+/// locks. Each held lock checks out one connection from the supplied pool for its
+/// entire lifetime. In particular, every live [`IndexWriter`][3] reserves one
+/// connection; size the pool for all concurrent directory locks plus normal metadata
+/// queries. The writer lock also publishes a fencing token checked by mutating
+/// metadata operations, so a writer that loses its lock cannot commit further
+/// changes.
 ///
 /// ## File-lookup cache
 ///
@@ -48,6 +53,7 @@ use crate::{
 ///
 /// [1]: tantivy::ReloadPolicy::Manual
 /// [2]: Self::prefetch_files
+/// [3]: tantivy::IndexWriter
 #[derive(Clone, Debug)]
 #[debug("FullDirectory {{ index: {} }}", context.index)]
 pub struct FullDirectory {
@@ -63,6 +69,9 @@ pub struct FullDirectory {
 
     /// Stores the metadata for the directory and its files.
     metadata: MetadataStore,
+
+    /// Acquires Tantivy's directory locks through PostgreSQL advisory locks.
+    locks: AdvisoryLocks,
 
     /// Buffers bundle-eligible files until they are written as one object per segment
     /// at sync time.
@@ -87,13 +96,18 @@ impl FullDirectory {
     /// This will panic if called from outside of the context of a `tokio` runtime.
     pub async fn open(index: Uuid, operator: opendal::Operator, pool: PgPool) -> Result<Self> {
         let context = Context::new(index);
-        let metadata = MetadataStore::open(&context, pool, operator.clone()).await?;
+        let rt = Handle::current();
+        let fence = WriterFence::default();
+        let metadata =
+            MetadataStore::open(&context, pool.clone(), operator.clone(), fence.clone()).await?;
+        let locks = AdvisoryLocks::new(index, pool, rt.clone(), fence);
 
         Ok(Self {
-            rt: Handle::current(),
+            rt,
             cache: Cache::default(),
             operator: Operator::from(operator),
             metadata,
+            locks,
             bundle: Bundler::default(),
             context,
         })
@@ -477,7 +491,7 @@ impl Directory for FullDirectory {
         Err(TantivyError::InternalError(error))
     }
 
-    fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
-        Ok(DirectoryLock::from(Box::new(())))
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        self.locks.acquire(lock)
     }
 }

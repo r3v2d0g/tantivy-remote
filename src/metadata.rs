@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use crate::{
     cache::FileLookupCache,
     context::Context,
+    lock::{FenceState, WriterFence},
     utils::{PathExt, WrapIoErrorExt},
 };
 
@@ -41,6 +42,11 @@ pub struct MetadataStore {
 
     /// The configuration shared with the directory that owns this store.
     pub(crate) context: Context,
+
+    /// Writer fence shared with [`AdvisoryLocks`][1].
+    ///
+    /// [1]: crate::lock::AdvisoryLocks
+    fence: WriterFence,
 
     /// Caches successful [`FileRecord`][1] lookups for this index.
     ///
@@ -115,7 +121,12 @@ impl MetadataStore {
     /// The `context` is cloned and kept for the lifetime of the store.
     ///
     /// If the index does not exists, it creates it.
-    pub(crate) async fn open(context: &Context, pool: PgPool, operator: Operator) -> Result<Self> {
+    pub(crate) async fn open(
+        context: &Context,
+        pool: PgPool,
+        operator: Operator,
+        fence: WriterFence,
+    ) -> Result<Self> {
         let create = sqlx::query(
             r#"
             INSERT INTO tantivy.directories (index)
@@ -134,6 +145,7 @@ impl MetadataStore {
             pool,
             operator,
             context: context.clone(),
+            fence,
             files: FileLookupCache::default(),
             lookup_queries: Arc::new(AtomicU64::new(0)),
         })
@@ -282,6 +294,7 @@ impl MetadataStore {
         }
 
         let mut transaction = self.pool.begin().await?;
+        self.ensure_writer_fence(&mut transaction).await?;
         let mut records = Vec::with_capacity(files.len());
 
         for file in files {
@@ -342,6 +355,9 @@ impl MetadataStore {
     ///
     /// On a successful delete the path is removed from the local lookup cache.
     pub async fn delete_file(&self, path: &str) -> sqlx::Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        self.ensure_writer_fence(&mut transaction).await?;
+
         let update = sqlx::query_scalar(
             r#"
             UPDATE tantivy.files
@@ -356,8 +372,10 @@ impl MetadataStore {
         let row: Option<i32> = update
             .bind(self.context.index)
             .bind(path)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await?;
+
+        transaction.commit().await?;
 
         let deleted = row.is_some();
         if deleted {
@@ -445,6 +463,15 @@ impl MetadataStore {
     pub async fn write_metadata(&self, filepath: &Path, content: &[u8]) -> io::Result<()> {
         // Below `threshold`, we write to PostgreSQL.
         if content.len() < self.context.threshold {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(io::Error::wrapper(filepath))?;
+            self.ensure_writer_fence(&mut transaction)
+                .await
+                .map_err(io::Error::wrapper(filepath))?;
+
             let query = sqlx::query(
                 r#"
                 INSERT INTO tantivy.metadata
@@ -460,11 +487,24 @@ impl MetadataStore {
                 .bind(self.context.index)
                 .bind(path)
                 .bind(content)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
+                .await
+                .map_err(io::Error::wrapper(filepath))?;
+
+            transaction
+                .commit()
                 .await
                 .map_err(io::Error::wrapper(filepath))?;
 
             return Ok(());
+        }
+
+        // Fail fast if this instance already lost its writer fence, before writing
+        // bytes that would only become visible after a later (fenced) marker write.
+        if matches!(self.fence.state(), FenceState::Lost) {
+            return Err(io::Error::other(
+                "writer fence lost: advisory lock session died",
+            ));
         }
 
         let path = self.context.path(filepath);
@@ -486,6 +526,15 @@ impl MetadataStore {
         // Record a marker row with `NULL` content so that `read_metadata` knows the
         // bytes live in the object store. This also clears any inline content left over
         // from a previous below-threshold write.
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(io::Error::wrapper(filepath))?;
+        self.ensure_writer_fence(&mut transaction)
+            .await
+            .map_err(io::Error::wrapper(filepath))?;
+
         let query = sqlx::query(
             r#"
             INSERT INTO tantivy.metadata
@@ -500,10 +549,81 @@ impl MetadataStore {
         query
             .bind(self.context.index)
             .bind(path)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(io::Error::wrapper(filepath))?;
+
+        transaction
+            .commit()
             .await
             .map_err(io::Error::wrapper(filepath))?;
 
         Ok(())
+    }
+
+    /// Ensures this store's writer fence still matches `tantivy.directories`.
+    ///
+    /// Must run inside `transaction` before any mutating statement so a lost or
+    /// superseded writer cannot publish changes.
+    async fn ensure_writer_fence(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> sqlx::Result<()> {
+        match self.fence.state() {
+            FenceState::Lost => Err(sqlx::Error::Io(io::Error::other(
+                "writer fence lost: advisory lock session died",
+            ))),
+
+            FenceState::Open => {
+                let query = sqlx::query_scalar(
+                    r#"
+                    SELECT 1
+                    FROM tantivy.directories
+                    WHERE index = $1
+                      AND writer_token IS NULL
+                    FOR UPDATE
+                    "#,
+                );
+
+                let row: Option<i32> = query
+                    .bind(self.context.index)
+                    .fetch_optional(&mut **transaction)
+                    .await?;
+
+                if row.is_some() {
+                    Ok(())
+                } else {
+                    Err(sqlx::Error::Io(io::Error::other(
+                        "writer fence held by another writer",
+                    )))
+                }
+            }
+
+            FenceState::Held(token) => {
+                let query = sqlx::query_scalar(
+                    r#"
+                    SELECT 1
+                    FROM tantivy.directories
+                    WHERE index = $1
+                      AND writer_token = $2
+                    FOR UPDATE
+                    "#,
+                );
+
+                let row: Option<i32> = query
+                    .bind(self.context.index)
+                    .bind(token)
+                    .fetch_optional(&mut **transaction)
+                    .await?;
+
+                if row.is_some() {
+                    Ok(())
+                } else {
+                    Err(sqlx::Error::Io(io::Error::other(
+                        "writer fence stale or lost",
+                    )))
+                }
+            }
+        }
     }
 }

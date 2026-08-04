@@ -20,6 +20,7 @@ use crate::{
     directory::is_metadata,
     empty::Empty,
     file::{File, Slice},
+    lock::{AdvisoryLocks, WriterFence},
     metadata::{FileRecord, MetadataStore, NewFile},
     utils::{PathExt, WrapIoErrorExt},
     writer::{OnDone, OpenSink, Outcome, Sink, Writer},
@@ -51,6 +52,13 @@ use crate::{
 /// path. Missing paths are not cached; after another process commits, call
 /// [`prefetch_files`][8] again on this directory instance.
 ///
+/// ## Lock connections
+///
+/// Tantivy directory locks use PostgreSQL session-level advisory locks. Each held
+/// lock checks out one connection from the supplied pool for its entire lifetime.
+/// In particular, every live [`IndexWriter`][9] reserves one connection; size the
+/// pool for all concurrent directory locks plus normal metadata queries.
+///
 /// [1]: crate::FullDirectory
 /// [2]: tantivy::directory::MmapDirectory
 /// [3]: Self::atomic_read
@@ -59,6 +67,7 @@ use crate::{
 /// [6]: tantivy::ReloadPolicy::Manual
 /// [7]: crate::bundle
 /// [8]: Self::prefetch_files
+/// [9]: tantivy::IndexWriter
 #[derive(Clone, Debug)]
 #[debug("LightDirectory {{ index: {}, inner: {inner:?} }}", metadata.context.index)]
 pub struct LightDirectory<D> {
@@ -68,6 +77,9 @@ pub struct LightDirectory<D> {
 
     /// Stores the metadata files for the directory.
     metadata: MetadataStore,
+
+    /// Acquires Tantivy's directory locks through PostgreSQL advisory locks.
+    locks: AdvisoryLocks,
 
     /// Buffers bundle-eligible files until they are written as one object per segment to
     /// the inner directory at sync time.
@@ -94,11 +106,15 @@ impl<D> LightDirectory<D> {
         pool: PgPool,
     ) -> Result<Self> {
         let context = Context::new(index);
-        let metadata = MetadataStore::open(&context, pool, operator).await?;
+        let rt = Handle::current();
+        let fence = WriterFence::default();
+        let metadata = MetadataStore::open(&context, pool.clone(), operator, fence.clone()).await?;
+        let locks = AdvisoryLocks::new(index, pool, rt.clone(), fence);
 
         Ok(Self {
-            rt: Handle::current(),
+            rt,
             metadata,
+            locks,
             bundle: Bundler::default(),
             inner,
         })
@@ -392,8 +408,7 @@ impl<D: Directory + Clone> Directory for LightDirectory<D> {
         self.inner.watch(callback)
     }
 
-    #[inline]
     fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
-        self.inner.acquire_lock(lock)
+        self.locks.acquire(lock)
     }
 }

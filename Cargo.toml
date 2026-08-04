@@ -30,7 +30,7 @@ pin-project-lite = "0.2"
 scc = "3.3"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid"] }
 tantivy = { version = "0.26", features = ["quickwit"] }
-tokio = { version = "1.48", features = ["sync"] }
+tokio = { version = "1.48", features = ["macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = "1.18"
 

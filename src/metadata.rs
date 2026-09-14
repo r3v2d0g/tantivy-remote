@@ -120,7 +120,7 @@ impl MetadataStore {
     ///
     /// The `context` is cloned and kept for the lifetime of the store.
     ///
-    /// If the index does not exists, it creates it.
+    /// Creates the directory row if it does not exist, without creating a Tantivy index.
     pub(crate) async fn open(
         context: &Context,
         pool: PgPool,
@@ -141,6 +141,19 @@ impl MetadataStore {
             .await
             .wrap_err("failed to create index")?;
 
+        Self::open_read_only(context, pool, operator, fence).await
+    }
+
+    /// Opens a metadata store without PostgreSQL writes or initialization.
+    ///
+    /// Missing directories and metadata remain absent. The context, caches and writer
+    /// fence are identical to those used by [`Self::open`].
+    pub(crate) async fn open_read_only(
+        context: &Context,
+        pool: PgPool,
+        operator: Operator,
+        fence: WriterFence,
+    ) -> Result<Self> {
         Ok(Self {
             pool,
             operator,

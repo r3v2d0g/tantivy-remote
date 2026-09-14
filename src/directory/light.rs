@@ -94,7 +94,8 @@ pub struct LightDirectory<D> {
 impl<D> LightDirectory<D> {
     /// Wraps `inner`, storing the metadata files for the given index in PostgreSQL.
     ///
-    /// If the index does not exist, it creates it.
+    /// Creates the directory row if absent. Creating a Tantivy index is a separate
+    /// operation through `tantivy::Index::create`.
     ///
     /// ## Panics
     ///
@@ -105,11 +106,46 @@ impl<D> LightDirectory<D> {
         operator: opendal::Operator,
         pool: PgPool,
     ) -> Result<Self> {
+        Self::open_impl(inner, index, operator, pool, false).await
+    }
+
+    /// Wraps `inner` without PostgreSQL writes or initialization.
+    ///
+    /// Missing metadata is reported as absent files; this never creates an empty
+    /// Tantivy index. Use `tantivy::Index::open` to open an existing index.
+    /// Read configuration and advisory locks are the same as for [`Self::open`].
+    /// This constructor does not disable subsequent write methods; use a read-only
+    /// PostgreSQL pool, storage credentials and inner directory for readers.
+    ///
+    /// ## Panics
+    ///
+    /// This will panic if called from outside of the context of a `tokio` runtime.
+    pub async fn open_read_only(
+        inner: D,
+        index: Uuid,
+        operator: opendal::Operator,
+        pool: PgPool,
+    ) -> Result<Self> {
+        Self::open_impl(inner, index, operator, pool, true).await
+    }
+
+    async fn open_impl(
+        inner: D,
+        index: Uuid,
+        operator: opendal::Operator,
+        pool: PgPool,
+        read_only: bool,
+    ) -> Result<Self> {
         let context = Context::new(index);
         let rt = Handle::current();
         let fence = WriterFence::default();
-        let metadata = MetadataStore::open(&context, pool.clone(), operator, fence.clone()).await?;
-        let locks = AdvisoryLocks::new(index, pool, rt.clone(), fence);
+
+        let locks = AdvisoryLocks::new(index, pool.clone(), rt.clone(), fence.clone());
+        let metadata = if read_only {
+            MetadataStore::open_read_only(&context, pool, operator, fence).await?
+        } else {
+            MetadataStore::open(&context, pool, operator, fence).await?
+        };
 
         Ok(Self {
             rt,

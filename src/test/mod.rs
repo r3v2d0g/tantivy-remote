@@ -4,3 +4,4 @@ mod empty;
 mod locking;
 mod lookup_cache;
 mod metadata;
+mod read_only;

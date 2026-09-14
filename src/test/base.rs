@@ -69,7 +69,6 @@ async fn basic() {
     });
 
     let reader = init.await.expect("failed to initialize reader");
-
     let write = task::spawn_blocking(move || {
         writer
             .add_document(doc!(
